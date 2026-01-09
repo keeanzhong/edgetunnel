@@ -46,11 +46,11 @@ export default {
         
         if (env.GO2SOCKS5) SOCKS5白名单 = await 整理成数组(env.GO2SOCKS5);
 
-        // 🌟🌟🌟 [修复] WebSocket 请求处理入口 (提前处理，避免嵌套错误) 🌟🌟🌟
+        // 🌟🌟🌟 [核心修复] WebSocket 请求处理入口 (VLESS/Trojan 流量) 🌟🌟🌟
         if (upgradeHeader === 'websocket') {
             if (管理员密码) {
                 await 反代参数获取(request);
-                // 进入带有鉴权功能的 WS 处理函数
+                // 进入带有【实时鉴权】功能的 WS 处理函数
                 return await 处理WS请求(request, env, adminUserID);
             }
             // 如果没有管理员密码，后续逻辑会处理（通常是伪装页）
@@ -220,17 +220,11 @@ export default {
 
                 ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
                 return fetch(Pages静态页面 + '/admin');
-            } 
-            
-            // 4. 退出登录
-            else if (访问路径 === 'logout') {
+            } else if (访问路径 === 'logout') {
                 const 响应 = new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
                 响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
                 return 响应;
-            } 
-            
-            // 5. 订阅下发
-            else if (访问路径 === 'sub') {
+            } else if (访问路径 === 'sub') {
                 const 订阅TOKEN = await MD5MD5(host + adminUserID);
                 if (url.searchParams.get('token') === 订阅TOKEN) {
                     config_JSON = await 读取config_JSON(env, host, adminUserID);
@@ -326,10 +320,7 @@ export default {
                     return new Response(订阅内容, { status: 200, headers: responseHeaders });
                 }
                 return new Response('无效的订阅TOKEN', { status: 403 });
-            } 
-            
-            // 6. 测速
-            else if (访问路径 === 'locations') return fetch(new Request('https://speed.cloudflare.com/locations'));
+            } else if (访问路径 === 'locations') return fetch(new Request('https://speed.cloudflare.com/locations'));
         }
 
         let 伪装页URL = env.URL || 'nginx';
@@ -353,7 +344,7 @@ export default {
 };
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-// 🌟🌟🌟 [新增] 核心鉴权逻辑：实时检查 KV 权限 🌟🌟🌟
+// 🌟🌟🌟 [核心逻辑] WebSocket 实时鉴权 (UUID 封禁生效的关键) 🌟🌟🌟
 async function 处理WS请求(request, env, adminUserID) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
@@ -364,7 +355,7 @@ async function 处理WS请求(request, env, adminUserID) {
     const readable = makeReadableStr(serverSock, earlyData);
     let 判断是否是木马 = null;
 
-    // 🌟 [优化] 提前触发 KV 读取，不阻塞握手，但在收到数据时 await
+    // 🌟 1. 立即触发 KV 异步读取 (不阻塞握手，但会在处理数据前等待结果)
     let kvCheckPromise = null;
     if (env.KV) {
         kvCheckPromise = Promise.all([
@@ -388,24 +379,23 @@ async function 处理WS请求(request, env, adminUserID) {
                 判断是否是木马 = bytes.byteLength >= 56 && bytes[56] === 0x0d && bytes[57] === 0x0a;
             }
 
-            if (remoteConnWrapper.socket) {
-                const writer = remoteConnWrapper.socket.writable.getWriter();
-                await writer.write(chunk);
-                writer.releaseLock();
-                return;
-            }
-
+            // 🌟🌟🌟 2. 拦截数据包进行鉴权 🌟🌟🌟
             if (判断是否是木马) {
-                // Trojan 协议鉴权 (暂未实现多用户 KV 检查，如有需要可模仿 VLESS 逻辑)
-                // 目前仅检查 Admin UUID
+                // Trojan 暂不支持多用户封禁（如有需求需解析Trojan密码）
+                // 默认只允许管理员
                 const { port, hostname, rawClientData } = 解析木马请求(chunk, adminUserID); 
                 if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
                 await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper);
             } else {
-                // 🌟🌟🌟 VLESS 协议核心鉴权点 🌟🌟🌟
-                const { port, hostname, rawIndex, version, isUDP, requestUUID } = 解析魏烈思请求(chunk);
+                // 🔥 VLESS 鉴权核心 🔥
+                const parseResult = 解析魏烈思请求(chunk);
+                if (parseResult.hasError) throw new Error('VLESS Parse Failed');
                 
-                // 🛑 核心鉴权：检查 UUID 是否被封禁 🛑
+                const { port, hostname, rawIndex, version, isUDP, requestUUID } = parseResult;
+                
+                // 🛑 核心：调用权限检查函数
+                // 必须等待检查通过，否则在这里抛出异常，断开连接
+                // 实现了你要求的：封禁UUID后，即便IP未封，也无法继续使用节点
                 await verifyUserPermission(requestUUID, adminUserID, kvCheckPromise);
 
                 if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
@@ -420,42 +410,55 @@ async function 处理WS请求(request, env, adminUserID) {
             }
         },
     })).catch((err) => {
-        // console.error('Readable pipe error:', err);
+        // 鉴权失败或连接错误，关闭 socket
         closeSocketQuietly(serverSock);
     });
 
     return new Response(null, { status: 101, webSocket: clientSock });
 }
 
-// 🌟🌟🌟 [新增] 权限校验函数 🌟🌟🌟
+// 🌟🌟🌟 [核心] 权限校验函数 (决定生死的判官) 🌟🌟🌟
 async function verifyUserPermission(uuid, adminUUID, kvPromise) {
-    // 1. 管理员永远放行
-    if (uuid === adminUUID) return true;
+    // 0. 标准化 UUID (全小写)，防止大小写绕过
+    const targetUUID = uuid.toLowerCase();
+    const admin = adminUUID.toLowerCase();
+
+    // 1. 管理员永远放行 (VIP通道)
+    if (targetUUID === admin) return true;
     
-    // 2. 如果没配 KV，默认只有管理员能用，其他人直接拒
-    if (!kvPromise) throw new Error('Auth Failed: No KV');
+    // 2. 如果没有 KV 且不是管理员，默认拒绝 (安全兜底)
+    if (!kvPromise) throw new Error('Auth Failed: System requires Admin');
 
     try {
         const [userList, blockList] = await kvPromise;
 
-        // 3. 检查是否在黑名单 (Token 封禁)
+        // 3. 检查黑名单 (直接封 UUID 字符串)
         if (blockList && Array.isArray(blockList)) {
-            if (blockList.some(b => b.value === uuid)) throw new Error('UUID Banned in Blocklist');
+            if (blockList.some(b => b.value === targetUUID)) throw new Error('UUID Banned in Blocklist');
         }
 
-        // 4. 检查用户列表权限
+        // 4. 检查用户列表 (白名单 + 状态检查)
         if (userList && Array.isArray(userList)) {
-            const user = userList.find(u => u.token === uuid);
-            if (!user) throw new Error('Invalid UUID'); // 不在列表里
-            if (user.enable === false) throw new Error('User Disabled'); // 被封禁
-            return true; // 验证通过
+            const user = userList.find(u => u.token.toLowerCase() === targetUUID);
+            
+            // 情况A: 用户不在列表里 -> 拒绝 (只有列表里的用户和管理员能用)
+            if (!user) throw new Error('Invalid UUID: Not in user list'); 
+            
+            // 情况B: 用户在列表里，但状态是 disabled -> 拒绝 (封禁生效点)
+            if (user.enable === false) throw new Error('User Disabled by Admin'); 
+            
+            // 情况C: 用户存在且 enable 为 true (或者 undefined 默认为 true) -> 放行
+            return true; 
         }
         
-        throw new Error('User list empty or invalid');
+        throw new Error('User list invalid');
     } catch (e) {
-        throw e; // 抛出错误以断开连接
+        // 这里抛出的错误会被处理函数捕获，从而关闭连接
+        throw e; 
     }
 }
+
+// ... 下面是底层的解析函数 ...
 
 function 解析木马请求(buffer, passwordPlainText) {
     const sha224Password = sha224(passwordPlainText);
@@ -516,11 +519,9 @@ function 解析木马请求(buffer, passwordPlainText) {
     };
 }
 
-// 🌟🌟🌟 [修改] 解析魏烈思请求：提取 requestUUID 🌟🌟🌟
 function 解析魏烈思请求(chunk) {
     if (chunk.byteLength < 24) return { hasError: true, message: 'Invalid data' };
     const version = new Uint8Array(chunk.slice(0, 1));
-    
     // 提取并格式化 UUID
     const requestUUID = formatIdentifier(new Uint8Array(chunk.slice(1, 17)));
     
@@ -554,7 +555,6 @@ function 解析魏烈思请求(chunk) {
     }
     if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
     
-    // 返回包含 requestUUID 的结果
     return { hasError: false, addressType, port, hostname, isUDP, rawIndex: addrValIdx + addrLen, version, requestUUID };
 }
 
@@ -640,6 +640,7 @@ function formatIdentifier(arr, offset = 0) {
     const hex = [...arr.slice(offset, offset + 16)].map(b => b.toString(16).padStart(2, '0')).join('');
     return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
 }
+
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
     let header = headerData, hasData = false;
     await remoteSocket.readable.pipeTo(
@@ -719,6 +720,7 @@ function base64ToArray(b64Str) {
         return { error };
     }
 }
+
 ////////////////////////////////SOCKS5/HTTP函数///////////////////////////////////////////////
 async function socks5Connect(targetHost, targetPort, initialData) {
     const { username, password, hostname, port } = parsedSocks5Address;
