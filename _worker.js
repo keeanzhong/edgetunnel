@@ -2,6 +2,8 @@ import { connect } from "cloudflare:sockets";
 
 // 🔴 核心配置：必须与订阅管理后台的 Key 保持一致
 const KV_USER_LIST_KEY = 'CF_USER_LIST'; 
+// 🔴 新增：封禁列表 Key
+const KV_BLOCKLIST_KEY = 'CF_BLOCKLIST';
 
 let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
@@ -34,18 +36,25 @@ export default {
 
         // 🌟🌟🌟 核心鉴权逻辑开始 🌟🌟🌟
         // 构建合法 UUID 白名单：管理员UUID + 后台创建的所有用户UUID
-        let allowedUUIDs = [adminUserID]; 
+        let allowedUUIDs = [adminUserID];
+        // 🔴 初始化封禁列表
+        let blockList = { uuid: [], ip: [], token: [] };
+        
         if (env.KV) {
             try {
-                // 尝试从 KV 读取订阅后台写入的用户列表
+                // 1. 读取用户列表 (白名单)
                 const userList = await env.KV.get(KV_USER_LIST_KEY, { type: 'json' });
                 if (userList && Array.isArray(userList)) {
-                    // 提取所有状态为启用的用户 Token (即 UUID)
                     const kvUUIDs = userList.filter(u => u.enable !== false).map(u => u.token);
                     allowedUUIDs = allowedUUIDs.concat(kvUUIDs);
                 }
+                
+                // 2. 🔴 读取封禁列表 (黑名单)
+                const blockListJson = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' });
+                if (blockListJson) {
+                    blockList = blockListJson;
+                }
             } catch (e) {
-                // 如果读取失败，暂不影响管理员登录
                 // console.log("KV读取失败，仅允许管理员");
             }
         }
@@ -306,8 +315,8 @@ export default {
             } else if (访问路径 === 'locations') return fetch(new Request('https://speed.cloudflare.com/locations'));
         } else if (管理员密码) {// ws代理
             await 反代参数获取(request);
-            // 🌟🌟🌟 调用WS处理时传入白名单 🌟🌟🌟
-            return await 处理WS请求(request, allowedUUIDs);
+            // 🔴 修改点 2: 传递封禁列表和管理员ID
+            return await 处理WS请求(request, allowedUUIDs, blockList, adminUserID);
         }
 
         let 伪装页URL = env.URL || 'nginx';
@@ -331,7 +340,8 @@ export default {
 };
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-async function 处理WS请求(request, allowedUUIDs) {
+// 🔴 修改点 3: 接收 blockList 和 adminUserID
+async function 处理WS请求(request, allowedUUIDs, blockList, adminUserID) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
     serverSock.accept();
@@ -371,6 +381,14 @@ async function 处理WS请求(request, allowedUUIDs) {
                 // 🌟🌟🌟 VLESS 协议核心鉴权点 🌟🌟🌟
                 const { port, hostname, rawIndex, version, isUDP, requestUUID } = 解析魏烈思请求(chunk);
                 
+                // 🔴 修改点 4: 黑名单检查 (优先级高于白名单，但低于管理员)
+                // 如果 UUID 在黑名单中 (无论是 uuid 还是 token 列表)，且不是管理员 ID，则封禁
+                if (blockList && (blockList.uuid.includes(requestUUID) || blockList.token.includes(requestUUID))) {
+                    if (requestUUID !== adminUserID) {
+                        throw new Error('UUID Blocked');
+                    }
+                }
+
                 // 检查请求的 UUID 是否在允许列表中 (管理员 + 用户)
                 if (!allowedUUIDs.includes(requestUUID)) {
                     // 非法 UUID，断开连接
