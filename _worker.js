@@ -2,6 +2,7 @@ import { connect } from "cloudflare:sockets";
 
 // 🔴 核心配置：必须与订阅管理后台的 Key 保持一致
 const KV_USER_LIST_KEY = 'CF_USER_LIST'; 
+const KV_BLOCKLIST_KEY = 'CF_BLOCKLIST';
 
 let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
@@ -10,6 +11,20 @@ const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////
 export default {
     async fetch(request, env, ctx) {
+        // 🌟🌟🌟 0. 全局 IP 封禁检查 (最优先) 🌟🌟🌟
+        const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('True-Client-IP') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || request.cf?.clientTcpRtt || '未知IP';
+        
+        if (env.KV) {
+            try {
+                const blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
+                if (blockList.some(item => item.value === 访问IP)) {
+                    return new Response("Access Denied: Your IP is banned.", { status: 403 });
+                }
+            } catch (e) {
+                // KV 读取失败时不阻断正常逻辑
+            }
+        }
+
         const url = new URL(request.url);
         const UA = request.headers.get('User-Agent') || 'null';
         const upgradeHeader = request.headers.get('Upgrade');
@@ -18,7 +33,7 @@ export default {
         const userIDMD5 = await MD5MD5(管理员密码 + 加密秘钥);
         const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
         const envUUID = env.UUID || env.uuid;
-        // 这是管理员的默认 UUID
+        // 这是管理员的默认 UUID (最高权限)
         const adminUserID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), userIDMD5.slice(16, 20), userIDMD5.slice(20)].join('-');
         
         const host = env.HOST ? env.HOST.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0] : url.hostname;
@@ -28,24 +43,22 @@ export default {
             反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
         } else 反代IP = (request.cf.colo + '.PrOxYIp.CmLiUsSsS.nEt').toLowerCase();
         
-        const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('True-Client-IP') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || request.cf?.clientTcpRtt || '未知IP';
-        
         if (env.GO2SOCKS5) SOCKS5白名单 = await 整理成数组(env.GO2SOCKS5);
 
-        // 🌟🌟🌟 核心鉴权逻辑开始 🌟🌟🌟
-        // 构建合法 UUID 白名单：管理员UUID + 后台创建的所有用户UUID
+        // 🌟🌟🌟 1. 核心鉴权逻辑：构建 UUID 白名单 🌟🌟🌟
+        // 允许列表默认包含管理员
         let allowedUUIDs = [adminUserID]; 
         if (env.KV) {
             try {
                 // 尝试从 KV 读取订阅后台写入的用户列表
                 const userList = await env.KV.get(KV_USER_LIST_KEY, { type: 'json' });
                 if (userList && Array.isArray(userList)) {
-                    // 提取所有状态为启用的用户 Token (即 UUID)
+                    // ⚠️ 关键点：只提取 enable !== false 的用户 UUID
+                    // 这样如果后台封禁了某个 UUID，它就不会出现在 allowedUUIDs 里，连接自然会被拒绝
                     const kvUUIDs = userList.filter(u => u.enable !== false).map(u => u.token);
                     allowedUUIDs = allowedUUIDs.concat(kvUUIDs);
                 }
             } catch (e) {
-                // 如果读取失败，暂不影响管理员登录
                 // console.log("KV读取失败，仅允许管理员");
             }
         }
