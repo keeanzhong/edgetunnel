@@ -3,6 +3,11 @@ import { connect } from "cloudflare:sockets";
 // 🔴 核心配置：必须与订阅管理后台的 Key 保持一致
 const KV_USER_LIST_KEY = 'CF_USER_LIST';
 const KV_BLOCKLIST_KEY = 'CF_BLOCKLIST';
+const KV_RATE_LIMIT_KEY = 'CF_RATE_LIMIT';
+
+// 🛡️ [新增] 防滥用配置 (仅限制订阅刷新，不限制节点使用)
+const RATE_LIMIT_WARNING = 20; // 每日警告阈值 (次)
+const RATE_LIMIT_BLOCK = 50;   // 每日封禁阈值 (次)
 
 let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
@@ -11,7 +16,8 @@ const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////
 export default {
     async fetch(request, env, ctx) {
-        // 🌟🌟🌟 [新增] 0. 全局 IP 封禁检查 (最优先阻断) 🌟🌟🌟
+        // 🌟🌟🌟 [新增功能] 0. 全局 IP 封禁检查 (最优先阻断) 🌟🌟🌟
+        // 只要 IP 在黑名单，直接 403，不再进行任何后续处理，实现与 UUID 封禁平级
         const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('True-Client-IP') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || request.cf?.clientTcpRtt || '未知IP';
         
         if (env.KV) {
@@ -22,7 +28,7 @@ export default {
                     return new Response(`Access Denied: Your IP (${访问IP}) is banned.`, { status: 403 });
                 }
             } catch (e) {
-                // KV 读取错误不阻断
+                // KV 读取错误不阻断，避免系统故障导致全挂
             }
         }
 
@@ -47,6 +53,7 @@ export default {
         if (env.GO2SOCKS5) SOCKS5白名单 = await 整理成数组(env.GO2SOCKS5);
 
         // 🌟🌟🌟 [核心修复] WebSocket 请求处理入口 (VLESS/Trojan 流量) 🌟🌟🌟
+        // 这里提前处理 WS，并注入 UUID 实时鉴权逻辑
         if (upgradeHeader === 'websocket') {
             if (管理员密码) {
                 await 反代参数获取(request);
@@ -220,13 +227,27 @@ export default {
 
                 ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
                 return fetch(Pages静态页面 + '/admin');
-            } else if (访问路径 === 'logout') {
+            } 
+            
+            // 4. 退出登录
+            else if (访问路径 === 'logout') {
                 const 响应 = new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
                 响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
                 return 响应;
-            } else if (访问路径 === 'sub') {
+            } 
+            
+            // 5. 订阅下发
+            else if (访问路径 === 'sub') {
                 const 订阅TOKEN = await MD5MD5(host + adminUserID);
                 if (url.searchParams.get('token') === 订阅TOKEN) {
+
+                    // 🛡️ [新增] 防滥用检查：检查该 IP 今日刷新次数
+                    // 如果超过限制，直接返回 429，不给订阅内容
+                    const limitStatus = await checkRateLimit(env, 访问IP);
+                    if (limitStatus === 'BLOCK') {
+                        return new Response("Rate Limit Exceeded: Too many refreshes.", { status: 429 });
+                    }
+
                     config_JSON = await 读取config_JSON(env, host, adminUserID);
                     ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_SUB', config_JSON));
                     const ua = UA.toLowerCase();
@@ -279,8 +300,18 @@ export default {
                                 } else {
                                     return null;
                                 }
+
+                                // 🚩 [新增功能] 节点自动识别国旗 (仅基于备注)
+                                let flag = "";
+                                if (节点备注.includes('移动') || 节点备注.includes('联通') || 节点备注.includes('电信')) {
+                                     // 如果是三大运营商，且备注里原本没旗子，加中国旗
+                                     if (!节点备注.includes('🇨🇳')) flag = " 🇨🇳";
+                                } 
+                                // ⚠️ 严格执行要求：如果识别不到运营商且备注里没有旗子，绝不使用访问者地区充数。
+                                const finalNodeName = flag ? `${节点备注}${flag}` : (节点备注 || config_JSON.优选订阅生成.SUBNAME);
+
                                 const 节点HOST = 随机替换通配符(host);
-                                return `${协议类型}://${config_JSON.UUID}@${节点地址}:${节点端口}?security=tls&type=${config_JSON.传输协议}&host=${节点HOST}&sni=${节点HOST}&path=${encodeURIComponent(config_JSON.随机路径 ? 随机路径() + 节点路径 : 节点路径) + TLS分片参数}&encryption=none${config_JSON.跳过证书验证 ? '&allowInsecure=1' : ''}#${encodeURIComponent(节点备注)}`;
+                                return `${协议类型}://${config_JSON.UUID}@${节点地址}:${节点端口}?security=tls&type=${config_JSON.传输协议}&host=${节点HOST}&sni=${节点HOST}&path=${encodeURIComponent(config_JSON.随机路径 ? 随机路径() + 节点路径 : 节点路径) + TLS分片参数}&encryption=none${config_JSON.跳过证书验证 ? '&allowInsecure=1' : ''}#${encodeURIComponent(finalNodeName)}`;
                             }).filter(item => item !== null).join('\n');
                             订阅内容 = btoa(其他节点LINK + 订阅内容);
                         } else { 
@@ -320,7 +351,10 @@ export default {
                     return new Response(订阅内容, { status: 200, headers: responseHeaders });
                 }
                 return new Response('无效的订阅TOKEN', { status: 403 });
-            } else if (访问路径 === 'locations') return fetch(new Request('https://speed.cloudflare.com/locations'));
+            } 
+            
+            // 6. 测速
+            else if (访问路径 === 'locations') return fetch(new Request('https://speed.cloudflare.com/locations'));
         }
 
         let 伪装页URL = env.URL || 'nginx';
@@ -344,7 +378,7 @@ export default {
 };
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-// 🌟🌟🌟 [核心逻辑] WebSocket 实时鉴权 (UUID 封禁生效的关键) 🌟🌟🌟
+// 🌟🌟🌟 [新增] 核心鉴权逻辑：实时检查 KV 权限 🌟🌟🌟
 async function 处理WS请求(request, env, adminUserID) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
@@ -355,7 +389,7 @@ async function 处理WS请求(request, env, adminUserID) {
     const readable = makeReadableStr(serverSock, earlyData);
     let 判断是否是木马 = null;
 
-    // 🌟 1. 立即触发 KV 异步读取 (不阻塞握手，但会在处理数据前等待结果)
+    // 🌟 [优化] 提前触发 KV 读取，不阻塞握手，但在收到数据时 await
     let kvCheckPromise = null;
     if (env.KV) {
         kvCheckPromise = Promise.all([
@@ -379,23 +413,34 @@ async function 处理WS请求(request, env, adminUserID) {
                 判断是否是木马 = bytes.byteLength >= 56 && bytes[56] === 0x0d && bytes[57] === 0x0a;
             }
 
-            // 🌟🌟🌟 2. 拦截数据包进行鉴权 🌟🌟🌟
+            if (remoteConnWrapper.socket) {
+                const writer = remoteConnWrapper.socket.writable.getWriter();
+                await writer.write(chunk);
+                writer.releaseLock();
+                return;
+            }
+
             if (判断是否是木马) {
-                // Trojan 暂不支持多用户封禁（如有需求需解析Trojan密码）
-                // 默认只允许管理员
-                const { port, hostname, rawClientData } = 解析木马请求(chunk, adminUserID); 
+                // Trojan 协议鉴权
+                const { port, hostname, rawClientData, hasError, password } = 解析木马请求(chunk, adminUserID); 
+                
+                // Trojan鉴权：检查 Hash 密码 (实际上Trojan发来的是hash，如果不是管理员，我们需要额外的逻辑来支持多用户Trojan。但这里至少能实现管理员的阻断)
+                // 如果你需要Trojan多用户封禁，需要更复杂的逻辑。目前这层鉴权能保证被禁用的UUID(如果作为Trojan密码使用)会被拦截。
+                if (hasError) throw new Error('Trojan Auth Failed'); 
+                
+                await verifyUserPermission(password, adminUserID, kvCheckPromise);
+
                 if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
                 await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper);
             } else {
-                // 🔥 VLESS 鉴权核心 🔥
+                // 🌟🌟🌟 VLESS 协议核心鉴权点 🌟🌟🌟
                 const parseResult = 解析魏烈思请求(chunk);
                 if (parseResult.hasError) throw new Error('VLESS Parse Failed');
                 
                 const { port, hostname, rawIndex, version, isUDP, requestUUID } = parseResult;
                 
-                // 🛑 核心：调用权限检查函数
-                // 必须等待检查通过，否则在这里抛出异常，断开连接
-                // 实现了你要求的：封禁UUID后，即便IP未封，也无法继续使用节点
+                // 🛑 核心鉴权：检查 UUID 是否被封禁 🛑
+                // 这是实现"平级封禁"的关键，即使 IP 没封，UUID 也会被拦截，立即断开连接
                 await verifyUserPermission(requestUUID, adminUserID, kvCheckPromise);
 
                 if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
@@ -410,51 +455,72 @@ async function 处理WS请求(request, env, adminUserID) {
             }
         },
     })).catch((err) => {
-        // 鉴权失败或连接错误，关闭 socket
+        // console.error('Readable pipe error:', err);
         closeSocketQuietly(serverSock);
     });
 
     return new Response(null, { status: 101, webSocket: clientSock });
 }
 
-// 🌟🌟🌟 [核心] 权限校验函数 (决定生死的判官) 🌟🌟🌟
+// 🌟🌟🌟 [新增] 权限校验函数 (UUID 平级封禁核心) 🌟🌟🌟
 async function verifyUserPermission(uuid, adminUUID, kvPromise) {
-    // 0. 标准化 UUID (全小写)，防止大小写绕过
+    if (!uuid) return false;
     const targetUUID = uuid.toLowerCase();
     const admin = adminUUID.toLowerCase();
 
-    // 1. 管理员永远放行 (VIP通道)
+    // 1. 管理员永远放行
     if (targetUUID === admin) return true;
     
-    // 2. 如果没有 KV 且不是管理员，默认拒绝 (安全兜底)
-    if (!kvPromise) throw new Error('Auth Failed: System requires Admin');
+    // 2. 如果没配 KV 且不是管理员，默认拒绝
+    if (!kvPromise) throw new Error('Auth Failed: No KV');
 
     try {
         const [userList, blockList] = await kvPromise;
 
-        // 3. 检查黑名单 (直接封 UUID 字符串)
+        // 3. 检查是否在黑名单 (Token 封禁)
         if (blockList && Array.isArray(blockList)) {
             if (blockList.some(b => b.value === targetUUID)) throw new Error('UUID Banned in Blocklist');
         }
 
-        // 4. 检查用户列表 (白名单 + 状态检查)
+        // 4. 检查用户列表权限
         if (userList && Array.isArray(userList)) {
             const user = userList.find(u => u.token.toLowerCase() === targetUUID);
-            
-            // 情况A: 用户不在列表里 -> 拒绝 (只有列表里的用户和管理员能用)
-            if (!user) throw new Error('Invalid UUID: Not in user list'); 
-            
-            // 情况B: 用户在列表里，但状态是 disabled -> 拒绝 (封禁生效点)
-            if (user.enable === false) throw new Error('User Disabled by Admin'); 
-            
-            // 情况C: 用户存在且 enable 为 true (或者 undefined 默认为 true) -> 放行
-            return true; 
+            if (!user) throw new Error('Invalid UUID'); // 不在列表里
+            if (user.enable === false) throw new Error('User Disabled'); // 被封禁
+            return true; // 验证通过
         }
         
-        throw new Error('User list invalid');
+        throw new Error('User list empty or invalid');
     } catch (e) {
-        // 这里抛出的错误会被处理函数捕获，从而关闭连接
-        throw e; 
+        throw e; // 抛出错误以断开连接
+    }
+}
+
+// 🛡️ [新增] 检查限流状态 (防滥用核心)
+async function checkRateLimit(env, ip) {
+    try {
+        const today = new Date().toISOString().split('T')[0]; // 获取日期 YYYY-MM-DD
+        const key = `${KV_RATE_LIMIT_KEY}:${today}:${ip}`;
+
+        let count = await env.KV.get(key);
+        count = parseInt(count) || 0;
+
+        // 如果超过阻断阈值
+        if (count >= RATE_LIMIT_BLOCK) {
+            return 'BLOCK';
+        }
+
+        // 计数 + 1，设置过期时间为 24 小时
+        await env.KV.put(key, (count + 1).toString(), { expirationTtl: 86400 });
+
+        // 如果超过警告阈值
+        if (count >= RATE_LIMIT_WARNING) {
+            return 'WARN';
+        }
+        return 'OK';
+    } catch (e) {
+        // KV 出错不阻断正常业务
+        return 'OK';
     }
 }
 
@@ -466,7 +532,10 @@ function 解析木马请求(buffer, passwordPlainText) {
     let crLfIndex = 56;
     if (new Uint8Array(buffer.slice(56, 57))[0] !== 0x0d || new Uint8Array(buffer.slice(57, 58))[0] !== 0x0a) return { hasError: true, message: "invalid header format" };
     const password = new TextDecoder().decode(buffer.slice(0, crLfIndex));
-    if (password !== sha224Password) return { hasError: true, message: "invalid password" };
+    // Trojan 密码验证，支持多用户需在此处扩展逻辑
+    // 如果 password 不匹配管理员密码，我们暂时返回 password 供 verifyUserPermission 检查 (假设 KV 存储了 hash)
+    // 但通常 VLESS 才是主要使用的协议
+    const isUser = password !== sha224Password;
 
     const socks5DataBuffer = buffer.slice(crLfIndex + 2);
     if (socks5DataBuffer.byteLength < 6) return { hasError: true, message: "invalid S5 request data" };
@@ -515,13 +584,16 @@ function 解析木马请求(buffer, passwordPlainText) {
         addressType: atype,
         port: portRemote,
         hostname: address,
-        rawClientData: socks5DataBuffer.slice(portIndex + 4)
+        rawClientData: socks5DataBuffer.slice(portIndex + 4),
+        password: password // 返回 hash 供鉴权
     };
 }
 
+// 🌟🌟🌟 [修改] 解析魏烈思请求：提取 requestUUID 🌟🌟🌟
 function 解析魏烈思请求(chunk) {
     if (chunk.byteLength < 24) return { hasError: true, message: 'Invalid data' };
     const version = new Uint8Array(chunk.slice(0, 1));
+    
     // 提取并格式化 UUID
     const requestUUID = formatIdentifier(new Uint8Array(chunk.slice(1, 17)));
     
@@ -640,7 +712,6 @@ function formatIdentifier(arr, offset = 0) {
     const hex = [...arr.slice(offset, offset + 16)].map(b => b.toString(16).padStart(2, '0')).join('');
     return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
 }
-
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
     let header = headerData, hasData = false;
     await remoteSocket.readable.pipeTo(
@@ -720,7 +791,6 @@ function base64ToArray(b64Str) {
         return { error };
     }
 }
-
 ////////////////////////////////SOCKS5/HTTP函数///////////////////////////////////////////////
 async function socks5Connect(targetHost, targetPort, initialData) {
     const { username, password, hostname, port } = parsedSocks5Address;
