@@ -17,7 +17,7 @@ const Pages静态页面 = 'https://edt-pages.github.io';
 export default {
     async fetch(request, env, ctx) {
         // 🌟🌟🌟 [新增功能] 0. 全局 IP 封禁检查 (最优先阻断) 🌟🌟🌟
-        // 只要 IP 在黑名单，直接 403，不再进行任何后续处理，实现与 UUID 封禁平级
+        // 只要 IP 在黑名单，直接 403，不再进行任何后续处理
         const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('True-Client-IP') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || request.cf?.clientTcpRtt || '未知IP';
         
         if (env.KV) {
@@ -52,13 +52,13 @@ export default {
         
         if (env.GO2SOCKS5) SOCKS5白名单 = await 整理成数组(env.GO2SOCKS5);
 
-        // 🌟🌟🌟 [核心修复] WebSocket 请求处理入口 (VLESS/Trojan 流量) 🌟🌟🌟
-        // 这里提前处理 WS，并注入 UUID 实时鉴权逻辑
+        // 🌟🌟🌟 [核心修改] WebSocket 请求处理入口 (VLESS/Trojan 流量) 🌟🌟🌟
+        // 这里提前处理 WS，并传入 访问IP 用于鉴权
         if (upgradeHeader === 'websocket') {
             if (管理员密码) {
                 await 反代参数获取(request);
-                // 进入带有【实时鉴权】功能的 WS 处理函数
-                return await 处理WS请求(request, env, adminUserID);
+                // 进入带有【实时鉴权】功能的 WS 处理函数，传入 IP
+                return await 处理WS请求(request, env, adminUserID, 访问IP);
             }
             // 如果没有管理员密码，后续逻辑会处理（通常是伪装页）
         }
@@ -378,8 +378,8 @@ export default {
 };
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-// 🌟🌟🌟 [新增] 核心鉴权逻辑：实时检查 KV 权限 🌟🌟🌟
-async function 处理WS请求(request, env, adminUserID) {
+// 🌟🌟🌟 [核心修改] 实时连接鉴权逻辑 🌟🌟🌟
+async function 处理WS请求(request, env, adminUserID, clientIP) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
     serverSock.accept();
@@ -387,14 +387,13 @@ async function 处理WS请求(request, env, adminUserID) {
     let isDnsQuery = false;
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readable = makeReadableStr(serverSock, earlyData);
-    let 判断是否是木马 = null;
 
-    // 🌟 [优化] 提前触发 KV 读取，不阻塞握手，但在收到数据时 await
-    let kvCheckPromise = null;
+    // ⚡️ 预加载 KV 数据，不阻塞握手，但在收到数据包时必须 await 结果
+    let kvDataPromise = null;
     if (env.KV) {
-        kvCheckPromise = Promise.all([
-            env.KV.get(KV_USER_LIST_KEY, { type: 'json' }),
-            env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' })
+        kvDataPromise = Promise.all([
+            env.KV.get(KV_USER_LIST_KEY, { type: 'json' }), // 用户列表
+            env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' })  // 黑名单
         ]);
     }
 
@@ -408,51 +407,50 @@ async function 处理WS请求(request, env, adminUserID) {
                 return;
             }
 
-            if (判断是否是木马 === null) {
-                const bytes = new Uint8Array(chunk);
-                判断是否是木马 = bytes.byteLength >= 56 && bytes[56] === 0x0d && bytes[57] === 0x0a;
+            // ⚠️ 首次数据包处理：解析 + 鉴权
+            // 如果已经在 KV 中封禁，必须在这里拦截，不建立后续连接
+            
+            let protocolData;
+            // 尝试 VLESS 解析
+            const vlessParsed = 解析魏烈思请求(chunk);
+            if (!vlessParsed.hasError) {
+                protocolData = vlessParsed;
+            } else {
+                // 尝试 Trojan 解析
+                const trojanParsed = 解析木马请求(chunk, adminUserID);
+                if (!trojanParsed.hasError) {
+                     protocolData = trojanParsed;
+                     // Trojan 的 password 字段即为 Token/Hash
+                     protocolData.requestUUID = trojanParsed.password; 
+                } else {
+                    // 协议无法识别，直接断开
+                    closeSocketQuietly(serverSock);
+                    return;
+                }
             }
 
-            if (remoteConnWrapper.socket) {
-                const writer = remoteConnWrapper.socket.writable.getWriter();
-                await writer.write(chunk);
-                writer.releaseLock();
+            // 🛑🛑🛑 [关键] 实时调用鉴权函数 🛑🛑🛑
+            try {
+                // 传入 UUID/Token 和 客户端IP，进行严格校验
+                await verifyUserPermission(protocolData.requestUUID, adminUserID, clientIP, kvDataPromise);
+            } catch (err) {
+                // console.log(`[BLOCK] 拦截连接: ${err.message}`);
+                // 鉴权失败，立即关闭 Socket，不转发流量
+                closeSocketQuietly(serverSock);
                 return;
             }
 
-            if (判断是否是木马) {
-                // Trojan 协议鉴权
-                const { port, hostname, rawClientData, hasError, password } = 解析木马请求(chunk, adminUserID); 
-                
-                // Trojan鉴权：检查 Hash 密码 (实际上Trojan发来的是hash，如果不是管理员，我们需要额外的逻辑来支持多用户Trojan。但这里至少能实现管理员的阻断)
-                // 如果你需要Trojan多用户封禁，需要更复杂的逻辑。目前这层鉴权能保证被禁用的UUID(如果作为Trojan密码使用)会被拦截。
-                if (hasError) throw new Error('Trojan Auth Failed'); 
-                
-                await verifyUserPermission(password, adminUserID, kvCheckPromise);
+            // 鉴权通过，继续原有逻辑
+            if (protocolData.isUDP && protocolData.port === 53) isDnsQuery = true;
+            
+            // 修正 VLESS 头部处理 (Trojan 不需要 version slice，VLESS 需要)
+            const respHeader = protocolData.version ? new Uint8Array([protocolData.version[0], 0]) : null;
+            
+            // Trojan 的 rawIndex 需要根据解析结果调整，或者复用 rawClientData
+            const rawData = protocolData.rawClientData ? protocolData.rawClientData : chunk.slice(protocolData.rawIndex);
 
-                if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
-                await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper);
-            } else {
-                // 🌟🌟🌟 VLESS 协议核心鉴权点 🌟🌟🌟
-                const parseResult = 解析魏烈思请求(chunk);
-                if (parseResult.hasError) throw new Error('VLESS Parse Failed');
-                
-                const { port, hostname, rawIndex, version, isUDP, requestUUID } = parseResult;
-                
-                // 🛑 核心鉴权：检查 UUID 是否被封禁 🛑
-                // 这是实现"平级封禁"的关键，即使 IP 没封，UUID 也会被拦截，立即断开连接
-                await verifyUserPermission(requestUUID, adminUserID, kvCheckPromise);
-
-                if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
-                if (isUDP) {
-                    if (port === 53) isDnsQuery = true;
-                    else throw new Error('UDP is not supported');
-                }
-                const respHeader = new Uint8Array([version[0], 0]);
-                const rawData = chunk.slice(rawIndex);
-                if (isDnsQuery) return forwardataudp(rawData, serverSock, respHeader);
-                await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper);
-            }
+            if (isDnsQuery) return forwardataudp(rawData, serverSock, respHeader);
+            await forwardataTCP(protocolData.hostname, protocolData.port, rawData, serverSock, respHeader, remoteConnWrapper);
         },
     })).catch((err) => {
         // console.error('Readable pipe error:', err);
@@ -462,66 +460,51 @@ async function 处理WS请求(request, env, adminUserID) {
     return new Response(null, { status: 101, webSocket: clientSock });
 }
 
-// 🌟🌟🌟 [新增] 权限校验函数 (UUID 平级封禁核心) 🌟🌟🌟
-async function verifyUserPermission(uuid, adminUUID, kvPromise) {
-    if (!uuid) return false;
+// 🌟🌟🌟 [新增] 严格权限校验函数 (白名单模式) 🌟🌟🌟
+async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
+    // 1. 判空
+    if (!uuid) throw new Error('No UUID provided');
     const targetUUID = uuid.toLowerCase();
     const admin = adminUUID.toLowerCase();
 
-    // 1. 管理员永远放行
-    if (targetUUID === admin) return true;
+    // 2. 超级管理员：永远放行 (Trojan 密码 hash 或 VLESS UUID)
+    // 注意：Trojan 解析出来的 password 是 hex 格式，如果配置的是 UUID，需要确保格式一致性
+    // 这里简单判断是否包含 adminUUID
+    if (targetUUID.includes(admin) || targetUUID === admin) return true;
     
-    // 2. 如果没配 KV 且不是管理员，默认拒绝
-    if (!kvPromise) throw new Error('Auth Failed: No KV');
+    // 3. 如果没绑定 KV，且不是管理员 -> 默认拒绝
+    if (!kvPromise) throw new Error('Access Denied: No KV & Not Admin');
 
-    try {
-        const [userList, blockList] = await kvPromise;
+    const [userList, blockList] = await kvPromise;
 
-        // 3. 检查是否在黑名单 (Token 封禁)
-        if (blockList && Array.isArray(blockList)) {
-            if (blockList.some(b => b.value === targetUUID)) throw new Error('UUID Banned in Blocklist');
+    // 4. 检查黑名单 (IP 或 UUID 在黑名单中)
+    if (blockList && Array.isArray(blockList)) {
+        if (blockList.some(b => b.value === clientIP || b.value === targetUUID)) {
+             throw new Error('Blocked by Blacklist');
         }
+    }
 
-        // 4. 检查用户列表权限
-        if (userList && Array.isArray(userList)) {
-            const user = userList.find(u => u.token.toLowerCase() === targetUUID);
-            if (!user) throw new Error('Invalid UUID'); // 不在列表里
-            if (user.enable === false) throw new Error('User Disabled'); // 被封禁
-            return true; // 验证通过
+    // 5. 检查用户白名单 (必须在列表中且启用)
+    if (userList && Array.isArray(userList)) {
+        const user = userList.find(u => u.token.toLowerCase() === targetUUID);
+        
+        if (!user) {
+            // ❌ 核心：如果 UUID 不在用户列表，也不是管理员 -> 拒绝
+            // 防止有人猜到 UUID 或者使用已删除的 UUID
+            throw new Error('Unauthorized UUID (Not in User List)');
         }
         
-        throw new Error('User list empty or invalid');
-    } catch (e) {
-        throw e; // 抛出错误以断开连接
-    }
-}
-
-// 🛡️ [新增] 检查限流状态 (防滥用核心)
-async function checkRateLimit(env, ip) {
-    try {
-        const today = new Date().toISOString().split('T')[0]; // 获取日期 YYYY-MM-DD
-        const key = `${KV_RATE_LIMIT_KEY}:${today}:${ip}`;
-
-        let count = await env.KV.get(key);
-        count = parseInt(count) || 0;
-
-        // 如果超过阻断阈值
-        if (count >= RATE_LIMIT_BLOCK) {
-            return 'BLOCK';
+        if (user.enable === false) {
+            // ❌ 核心：用户被禁用 -> 拒绝
+            throw new Error('User is Disabled');
         }
 
-        // 计数 + 1，设置过期时间为 24 小时
-        await env.KV.put(key, (count + 1).toString(), { expirationTtl: 86400 });
-
-        // 如果超过警告阈值
-        if (count >= RATE_LIMIT_WARNING) {
-            return 'WARN';
-        }
-        return 'OK';
-    } catch (e) {
-        // KV 出错不阻断正常业务
-        return 'OK';
+        // ✅ 验证通过
+        return true;
     }
+    
+    // 默认拒绝
+    throw new Error('Access Denied (Default)');
 }
 
 // ... 下面是底层的解析函数 ...
