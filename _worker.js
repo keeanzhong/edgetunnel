@@ -5,9 +5,9 @@ const KV_USER_LIST_KEY = 'CF_USER_LIST';
 const KV_BLOCKLIST_KEY = 'CF_BLOCKLIST';
 const KV_RATE_LIMIT_KEY = 'CF_RATE_LIMIT';
 
-// 🛡️ [新增] 防滥用配置 (仅限制订阅刷新，不限制节点使用)
-const RATE_LIMIT_WARNING = 20; // 每日警告阈值 (次)
-const RATE_LIMIT_BLOCK = 50;   // 每日封禁阈值 (次)
+// 🛡️ [防滥用配置]
+const RATE_LIMIT_WARNING = 20; 
+const RATE_LIMIT_BLOCK = 50;   
 
 let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
@@ -21,7 +21,6 @@ export default {
         
         if (env.KV) {
             try {
-                // 读取黑名单，如果 IP 存在直接 403
                 const blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
                 if (blockList.some(item => item.value === 访问IP)) {
                     return new Response(`Access Denied: Your IP (${访问IP}) is banned.`, { status: 403 });
@@ -37,7 +36,7 @@ export default {
         const userIDMD5 = await MD5MD5(管理员密码 + 加密秘钥);
         const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
         const envUUID = env.UUID || env.uuid;
-        // 这是管理员的默认 UUID (超级用户，不受 KV 限制)
+        // 这是管理员的默认 UUID (超级用户)
         const adminUserID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), userIDMD5.slice(16, 20), userIDMD5.slice(20)].join('-');
         
         const host = env.HOST ? env.HOST.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0] : url.hostname;
@@ -488,6 +487,43 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
     
     // 默认拒绝
     throw new Error('Access Denied (Default)');
+}
+
+// 🛡️ [核心修改] 检查限流状态 + 自动拉黑
+async function checkRateLimit(env, ip) {
+    try {
+        const today = new Date().toISOString().split('T')[0]; // 获取日期 YYYY-MM-DD
+        const key = `${KV_RATE_LIMIT_KEY}:${today}:${ip}`;
+
+        let count = await env.KV.get(key);
+        count = parseInt(count) || 0;
+
+        // 如果超过阻断阈值
+        if (count >= RATE_LIMIT_BLOCK) {
+            // 🚨 触发封禁：直接写入黑名单 KV
+            // 注意：edgetunnel 通常只负责读取黑名单，这里增加写入逻辑是为了同步防滥用状态
+            let blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
+            if (!blockList.some(item => item.value === ip)) {
+                blockList.push({ 
+                    value: ip, 
+                    note: '⚠️ 防滥用自动封禁', 
+                    time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) 
+                });
+                await env.KV.put(KV_BLOCKLIST_KEY, JSON.stringify(blockList));
+            }
+            return 'BLOCK';
+        }
+
+        // 计数 + 1
+        await env.KV.put(key, (count + 1).toString(), { expirationTtl: 86400 });
+
+        if (count >= RATE_LIMIT_WARNING) {
+            return 'WARN';
+        }
+        return 'OK';
+    } catch (e) {
+        return 'OK';
+    }
 }
 
 // ... 下面是底层的解析函数 ...
