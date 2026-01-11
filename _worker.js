@@ -4,6 +4,7 @@ import { connect } from "cloudflare:sockets";
 const KV_USER_LIST_KEY = 'CF_USER_LIST';
 const KV_BLOCKLIST_KEY = 'CF_BLOCKLIST';
 const KV_RATE_LIMIT_KEY = 'CF_RATE_LIMIT';
+const KV_ACCESS_LOGS_KEY = 'CF_ACCESS_LOGS'; // 🌟 新增：与项目二同步日志 Key
 
 // 🛡️ [防滥用配置]
 const RATE_LIMIT_WARNING = 20;
@@ -102,8 +103,9 @@ export default {
                 if (!authCookie || authCookie !== await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
 
                 if (访问路径 === 'admin/log.json') {
-                    const 读取日志内容 = await env.KV.get('log.json') || '[]';
-                    return new Response(读取日志内容, { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+                    // 🌟 修改：读取统一日志
+                    const logs = await env.KV.get(KV_ACCESS_LOGS_KEY, { type: 'json' }) || [];
+                    return new Response(JSON.stringify(logs, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                 } else if (区分大小写访问路径 === 'admin/getCloudflareUsage') {
                     try {
                         const Usage_JSON = await getCloudflareUsage(url.searchParams.get('Email'), url.searchParams.get('GlobalAPIKey'), url.searchParams.get('AccountID'), url.searchParams.get('APIToken'));
@@ -369,7 +371,7 @@ export default {
 };
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-// 🌟🌟🌟 [核心修改] 实时连接鉴权逻辑 + 自动封禁 + 日志记录 🌟🌟🌟
+// 🌟🌟🌟 [核心修改] 实时连接鉴权逻辑 + 自动封禁 + 日志记录 (同步至项目二) 🌟🌟🌟
 async function 处理WS请求(request, env, ctx, adminUserID, clientIP) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
@@ -379,17 +381,19 @@ async function 处理WS请求(request, env, ctx, adminUserID, clientIP) {
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readable = makeReadableStr(serverSock, earlyData);
 
-    // 读取配置用于日志记录 (异步获取，不阻塞主流程)
-    // 注意：这里可能会因为并发问题导致 config_JSON 尚未初始化，所以简单处理
+    // 读取配置用于日志记录
     let currentConfig = { 优选订阅生成: { SUBNAME: 'edgetunnel' }, CF: { Usage: { success: false } }, TG: { 启用: false } };
     try {
         const storedConfig = await env.KV.get('config.json');
         if (storedConfig) currentConfig = JSON.parse(storedConfig);
     } catch(e) {}
 
+    // 获取 UserID 用于日志记录 (从请求中解析)
+    // 注意：解析逻辑在 write 回调中，这里我们需要一个 Promise 来等待解析结果以便记录日志
+    // 简化处理：我们在 verify 阶段拿到 UUID 后直接记录
+
     readable.pipeTo(new WritableStream({
         async write(chunk) {
-            // 如果连接已建立，直接转发
             if (remoteConnWrapper.socket) {
                 const writer = remoteConnWrapper.socket.writable.getWriter();
                 await writer.write(chunk);
@@ -397,18 +401,15 @@ async function 处理WS请求(request, env, ctx, adminUserID, clientIP) {
                 return;
             }
 
-            // 首次数据包处理：解析 + 鉴权
             let protocolData;
-            // 尝试 VLESS 解析
             const vlessParsed = 解析魏烈思请求(chunk);
             if (!vlessParsed.hasError) {
                 protocolData = vlessParsed;
             } else {
-                // 尝试 Trojan 解析
                 const trojanParsed = 解析木马请求(chunk, adminUserID);
                 if (!trojanParsed.hasError) {
                     protocolData = trojanParsed;
-                    protocolData.requestUUID = trojanParsed.password; // Trojan password 作为鉴权key
+                    protocolData.requestUUID = trojanParsed.password; 
                 } else {
                     closeSocketQuietly(serverSock);
                     return;
@@ -417,33 +418,32 @@ async function 处理WS请求(request, env, ctx, adminUserID, clientIP) {
 
             // 🛑🛑🛑 [关键] 实时鉴权 & 自动封禁 & 日志记录 🛑🛑🛑
             try {
-                // 验证权限
+                // 1. 验证权限
+                // 传递 ctx 用于内部异步封禁 (虽然 autoBanIP 用 waitUntil 也可以)
                 await verifyUserPermission(protocolData.requestUUID, adminUserID, clientIP, env);
                 
-                // ✅ 验证通过：记录连接日志
-                ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Success', currentConfig));
+                // 2. 验证通过：记录连接日志 (格式适配项目二)
+                // 仅记录连接成功，避免日志爆炸
+                ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Success', currentConfig, protocolData.requestUUID));
                 
             } catch (err) {
-                // ❌ 验证失败
+                // 3. 验证失败处理
                 if (err.message === 'User Disabled') {
-                    // 🚨 触发核心痛点解决逻辑：自动将 IP 加入黑名单
-                    // 使用 waitUntil 异步处理，确保不阻塞错误返回，但也确保执行
+                    // 🚨 核心逻辑：禁用即拉黑
+                    console.log(`[BLOCK] User Disabled: ${protocolData.requestUUID}, Banning IP: ${clientIP}`);
                     ctx.waitUntil(autoBanIP(env, clientIP));
-                    ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Block_Disabled', currentConfig));
+                    ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Block_Disabled', currentConfig, protocolData.requestUUID));
                 } else if (err.message === 'IP Blocked') {
-                    ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Block_IP', currentConfig));
+                    ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Block_IP', currentConfig, protocolData.requestUUID));
                 } else {
-                     ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Block_Auth', currentConfig));
+                     ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Block_Auth', currentConfig, protocolData.requestUUID));
                 }
                 
-                // 断开连接
                 closeSocketQuietly(serverSock);
                 return;
             }
 
-            // 鉴权通过，建立连接
             if (protocolData.isUDP && protocolData.port === 53) isDnsQuery = true;
-
             const respHeader = protocolData.version ? new Uint8Array([protocolData.version[0], 0]) : null;
             const rawData = protocolData.rawClientData ? protocolData.rawClientData : chunk.slice(protocolData.rawIndex);
 
@@ -468,6 +468,7 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, env) {
          throw new Error('Access Denied: No KV & Not Admin');
     }
 
+    // 1. 查黑名单 (强制同步)
     const blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
     if (blockList && Array.isArray(blockList)) {
         if (blockList.some(item => item.value === clientIP)) {
@@ -475,13 +476,14 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, env) {
         }
     }
 
+    // 2. 查用户表
     const userList = await env.KV.get(KV_USER_LIST_KEY, { type: 'json' }) || [];
     if (userList && Array.isArray(userList)) {
         const user = userList.find(u => normalize(u.token) === targetUUID);
         if (user) {
             // ✅ 找到了用户，检查状态
             if (user.enable === false) {
-                // ❌ 用户被禁用，抛出特定错误，触发外部的自动封 IP 逻辑
+                // ❌ 用户被禁用 -> 抛出特定错误
                 throw new Error('User Disabled'); 
             }
             return true;
@@ -493,7 +495,7 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, env) {
     throw new Error('Access Denied (Unauthorized UUID)');
 }
 
-// 🚨 [新功能] 自动封禁 IP 逻辑
+// 🚨 [核心功能] 自动封禁 IP 逻辑
 async function autoBanIP(env, ip) {
     try {
         let blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
@@ -501,7 +503,7 @@ async function autoBanIP(env, ip) {
         if (!blockList.some(item => item.value === ip)) {
             blockList.push({ 
                 value: ip, 
-                note: '🚫 用户禁用自动拉黑', 
+                note: '🚫 用户禁用自动拉黑(WS)', 
                 time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) 
             });
             await env.KV.put(KV_BLOCKLIST_KEY, JSON.stringify(blockList));
@@ -540,6 +542,82 @@ async function checkRateLimit(env, ip) {
     } catch (e) {
         return 'OK';
     }
+}
+
+// 📝 [核心修改] 统一日志记录函数 (适配项目二格式)
+async function 请求日志记录(env, request, 访问IP, 请求类型, config_JSON, targetUUID = '') {
+    const KV容量限制 = 4;//MB
+    const MAX_LOGS = 100; // 限制条数，与项目二保持一致
+    
+    try {
+        // 1. 发送 TG 通知 (保留原有逻辑)
+        if (config_JSON.TG && config_JSON.TG.启用) {
+            try {
+                const TG_TXT = await env.KV.get('tg.json');
+                const TG_JSON = JSON.parse(TG_TXT);
+                const logForTG = { 
+                    TYPE: 请求类型, IP: 访问IP, 
+                    ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, 
+                    CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, 
+                    URL: request.url, 
+                    UA: request.headers.get('User-Agent') || 'Unknown', 
+                    TIME: Date.now() 
+                };
+                await sendMessage(TG_JSON.BotToken, TG_JSON.ChatID, logForTG, config_JSON);
+            } catch (error) { console.error(`TG Send Error: ${error.message}`) }
+        }
+
+        // 2. 写入 KV (CF_ACCESS_LOGS) - 适配项目二格式
+        if (env.KV) {
+            let logs = await env.KV.get(KV_ACCESS_LOGS_KEY, { type: 'json' }) || [];
+            
+            // 构造身份 Identity
+            let identity = '未知/匿名';
+            let userNote = '';
+            
+            // 尝试从 KV 读取用户列表来匹配备注 (需要再次读取，或者传入)
+            // 为性能考虑，简单匹配或留空，主要依靠 token 识别
+            // 如果能获取到用户列表最好
+            if (targetUUID) {
+               try {
+                   const userList = await env.KV.get(KV_USER_LIST_KEY, { type: 'json' }) || [];
+                   const user = userList.find(u => u.token === targetUUID);
+                   if (user) userNote = user.note;
+               } catch(e){}
+            }
+
+            if (targetUUID && userNote) identity = `用户: ${userNote}`;
+            else if (targetUUID) identity = `Token: ${targetUUID.slice(0,8)}...`;
+            else identity = 请求类型; // 如果没有 UUID，显示请求类型
+
+            const country = request.cf?.country || 'UN';
+            const flag = getFlagEmoji(country);
+            const location = request.cf ? `${country} ${flag} - ${request.cf.city}` : '未知位置';
+            
+            const newLog = {
+                timestamp: Date.now(),
+                time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }),
+                ip: 访问IP,
+                ua: request.headers.get('User-Agent') || 'Unknown',
+                token: targetUUID || '',
+                identity: identity,
+                location: location,
+                warning: 请求类型.includes('Block') ? `⛔️ 阻断: ${请求类型}` : (请求类型 === 'Connect_Success' ? '🟢 节点连接' : 请求类型)
+            };
+
+            logs.unshift(newLog);
+            if (logs.length > MAX_LOGS) logs = logs.slice(0, MAX_LOGS);
+            
+            await env.KV.put(KV_ACCESS_LOGS_KEY, JSON.stringify(logs));
+        }
+
+    } catch (error) { console.error(`日志记录失败: ${error.message}`); }
+}
+
+function getFlagEmoji(countryCode) {
+    if (!countryCode) return '';
+    const codePoints = countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt());
+    return String.fromCodePoint(...codePoints);
 }
 
 // ... 下面是底层的解析函数 ...
@@ -897,39 +975,6 @@ function surge(content, url, config_JSON) {
 
     输出内容 = `#!MANAGED-CONFIG ${url} interval=${config_JSON.优选订阅生成.SUBUpdateTime * 60 * 60} strict=false` + 输出内容.substring(输出内容.indexOf('\n'));
     return 输出内容;
-}
-
-async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SUB", config_JSON) {
-    const KV容量限制 = 4;//MB
-    try {
-        const 当前时间 = new Date();
-        const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
-        let 日志数组 = [];
-        const 现有日志 = await env.KV.get('log.json');
-        if (现有日志) {
-            try {
-                日志数组 = JSON.parse(现有日志);
-                if (!Array.isArray(日志数组)) { 日志数组 = [日志内容]; }
-                else if (请求类型 !== "Get_SUB") {
-                    const 三十分钟前时间戳 = 当前时间.getTime() - 30 * 60 * 1000;
-                    if (日志数组.some(log => log.TYPE !== "Get_SUB" && log.IP === 访问IP && log.URL === request.url && log.UA === (request.headers.get('User-Agent') || 'Unknown') && log.TIME >= 三十分钟前时间戳)) return;
-                    日志数组.push(日志内容);
-                    while (JSON.stringify(日志数组, null, 2).length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) 日志数组.shift();
-                } else {
-                    日志数组.push(日志内容);
-                    while (JSON.stringify(日志数组, null, 2).length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) 日志数组.shift();
-                }
-                if (config_JSON.TG.启用) {
-                    try {
-                        const TG_TXT = await env.KV.get('tg.json');
-                        const TG_JSON = JSON.parse(TG_TXT);
-                        await sendMessage(TG_JSON.BotToken, TG_JSON.ChatID, 日志内容, config_JSON);
-                    } catch (error) { console.error(`读取tg.json出错: ${error.message}`) }
-                }
-            } catch (e) { 日志数组 = [日志内容]; }
-        } else { 日志数组 = [日志内容]; }
-        await env.KV.put('log.json', JSON.stringify(日志数组, null, 2));
-    } catch (error) { console.error(`日志记录失败: ${error.message}`); }
 }
 
 async function sendMessage(BotToken, ChatID, 日志内容, config_JSON) {
