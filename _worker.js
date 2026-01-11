@@ -54,8 +54,8 @@ export default {
         if (upgradeHeader === 'websocket') {
             if (管理员密码) {
                 await 反代参数获取(request);
-                // 传入 KV, AdminID, IP 进行严格鉴权
-                return await 处理WS请求(request, env, adminUserID, 访问IP);
+                // 传入 KV, AdminID, IP, ctx 进行严格鉴权和日志记录
+                return await 处理WS请求(request, env, ctx, adminUserID, 访问IP);
             }
         }
 
@@ -369,8 +369,8 @@ export default {
 };
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-// 🌟🌟🌟 [核心修改] 实时连接鉴权逻辑 (解决节点不失效问题) 🌟🌟🌟
-async function 处理WS请求(request, env, adminUserID, clientIP) {
+// 🌟🌟🌟 [核心修改] 实时连接鉴权逻辑 + 自动封禁 + 日志记录 🌟🌟🌟
+async function 处理WS请求(request, env, ctx, adminUserID, clientIP) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
     serverSock.accept();
@@ -379,7 +379,13 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readable = makeReadableStr(serverSock, earlyData);
 
-    // ⚡️ 移除并行预加载，改为严格同步执行
+    // 读取配置用于日志记录 (异步获取，不阻塞主流程)
+    // 注意：这里可能会因为并发问题导致 config_JSON 尚未初始化，所以简单处理
+    let currentConfig = { 优选订阅生成: { SUBNAME: 'edgetunnel' }, CF: { Usage: { success: false } }, TG: { 启用: false } };
+    try {
+        const storedConfig = await env.KV.get('config.json');
+        if (storedConfig) currentConfig = JSON.parse(storedConfig);
+    } catch(e) {}
 
     readable.pipeTo(new WritableStream({
         async write(chunk) {
@@ -409,12 +415,28 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
                 }
             }
 
-            // 🛑🛑🛑 [关键] 实时鉴权：必须通过 verifyUserPermission 🛑🛑🛑
-            // 修正：强制传递 env 并在内部实时查询
+            // 🛑🛑🛑 [关键] 实时鉴权 & 自动封禁 & 日志记录 🛑🛑🛑
             try {
+                // 验证权限
                 await verifyUserPermission(protocolData.requestUUID, adminUserID, clientIP, env);
+                
+                // ✅ 验证通过：记录连接日志
+                ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Success', currentConfig));
+                
             } catch (err) {
-                // console.log(`[BLOCK] 连接被拒绝: ${err.message}`);
+                // ❌ 验证失败
+                if (err.message === 'User Disabled') {
+                    // 🚨 触发核心痛点解决逻辑：自动将 IP 加入黑名单
+                    // 使用 waitUntil 异步处理，确保不阻塞错误返回，但也确保执行
+                    ctx.waitUntil(autoBanIP(env, clientIP));
+                    ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Block_Disabled', currentConfig));
+                } else if (err.message === 'IP Blocked') {
+                    ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Block_IP', currentConfig));
+                } else {
+                     ctx.waitUntil(请求日志记录(env, request, clientIP, 'Connect_Block_Auth', currentConfig));
+                }
+                
+                // 断开连接
                 closeSocketQuietly(serverSock);
                 return;
             }
@@ -435,59 +457,59 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
     return new Response(null, { status: 101, webSocket: clientSock });
 }
 
-// 🌟🌟🌟 [核心修改] 严格权限校验函数 (逻辑已修正) 🌟🌟🌟
+// 🌟🌟🌟 [核心修改] 严格权限校验函数 🌟🌟🌟
 async function verifyUserPermission(uuid, adminUUID, clientIP, env) {
-    // 0. 基础数据清洗 & 归一化 (移除所有横杠，转小写)
-    // 这样 2b6cf31f-d391... 和 2b6cf31fd391... 都会被视为同一个
     const normalize = (s) => (s || '').toLowerCase().trim().replace(/-/g, '');
-    
     const targetUUID = normalize(uuid);
     const admin = normalize(adminUUID);
 
-    // 1. 如果没绑定 KV，降级为仅管理员模式
     if (!env.KV) {
          if (targetUUID === admin) return true;
          throw new Error('Access Denied: No KV & Not Admin');
     }
 
-    // ⚡️ 强制同步等待读取 KV，拒绝并行/缓存
     const blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
-    
-    // 🛑 2. 查黑名单 (KV_BLOCKLIST)：优先封杀 IP
     if (blockList && Array.isArray(blockList)) {
         if (blockList.some(item => item.value === clientIP)) {
-            throw new Error('IP Blocked'); // 发现IP在黑名单，直接杀
+            throw new Error('IP Blocked'); 
         }
     }
 
-    // ⚡️ 强制同步读取用户列表
     const userList = await env.KV.get(KV_USER_LIST_KEY, { type: 'json' }) || [];
-
-    // 👥 3. 查用户表 (KV_USER_LIST)
     if (userList && Array.isArray(userList)) {
-        // 使用归一化后的 UUID 进行模糊匹配
         const user = userList.find(u => normalize(u.token) === targetUUID);
-        
         if (user) {
-            // ✅ 找到了用户，现在检查它的状态
+            // ✅ 找到了用户，检查状态
             if (user.enable === false) {
-                // ❌ 核心：用户存在，但被禁用了 -> 拒绝连接
-                // 绝对不许继续往下走去匹配管理员
+                // ❌ 用户被禁用，抛出特定错误，触发外部的自动封 IP 逻辑
                 throw new Error('User Disabled'); 
             }
-            // ✅ 用户存在且启用 -> 放行
             return true;
         }
     }
 
-    // 🔑 4. 查管理员权限 (只有在用户表里没找到这个 UUID 时才执行)
     if (targetUUID === admin) return true;
     
-    // ❌ 5. 默认拒绝 (既不在用户表，也不是管理员)
     throw new Error('Access Denied (Unauthorized UUID)');
 }
 
-// 🛡️ [核心修改] 检查限流状态 + 自动拉黑
+// 🚨 [新功能] 自动封禁 IP 逻辑
+async function autoBanIP(env, ip) {
+    try {
+        let blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
+        // 防止重复添加
+        if (!blockList.some(item => item.value === ip)) {
+            blockList.push({ 
+                value: ip, 
+                note: '🚫 用户禁用自动拉黑', 
+                time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) 
+            });
+            await env.KV.put(KV_BLOCKLIST_KEY, JSON.stringify(blockList));
+        }
+    } catch (e) { console.error('Auto Ban Failed:', e); }
+}
+
+// 🛡️ [防滥用] 检查限流状态
 async function checkRateLimit(env, ip) {
     try {
         const today = new Date().toISOString().split('T')[0];
@@ -497,7 +519,6 @@ async function checkRateLimit(env, ip) {
         count = parseInt(count) || 0;
 
         if (count >= RATE_LIMIT_BLOCK) {
-            // 🚨 触发封禁：直接写入黑名单 KV
             let blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
             if (!blockList.some(item => item.value === ip)) {
                 blockList.push({ 
@@ -510,7 +531,6 @@ async function checkRateLimit(env, ip) {
             return 'BLOCK';
         }
 
-        // 计数 + 1
         await env.KV.put(key, (count + 1).toString(), { expirationTtl: 86400 });
 
         if (count >= RATE_LIMIT_WARNING) {
@@ -629,7 +649,6 @@ function 解析魏烈思请求(chunk) {
 }
 
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper) {
-    // console.log(JSON.stringify({ configJSON: { 目标地址: host, 目标端口: portNum, 反代IP: 反代IP, 代理类型: 启用SOCKS5反代, 全局代理: 启用SOCKS5全局反代, 代理账号: 我的SOCKS5账号 } }));
     async function connectDirect(address, port, data) {
         const remoteSock = connect({ hostname: address, port: port });
         const writer = remoteSock.writable.getWriter();
