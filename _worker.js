@@ -19,11 +19,11 @@ export default {
         // 🌟🌟🌟 0. 全局 IP 封禁检查 (HTTP层最优先阻断) 🌟🌟🌟
         const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || '未知IP';
         
+        // 优先读取黑名单，如果 IP 在黑名单中，HTTP 层面直接拒绝，节省资源
         if (env.KV) {
             try {
-                // 尝试读取黑名单
                 const blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
-                // 如果 IP 在黑名单，直接 403
+                // 这里只检查 IP，因为 UUID 是在 WS 握手阶段解析的
                 if (blockList.some(item => item.value === 访问IP)) {
                     return new Response(`Access Denied: Your IP (${访问IP}) is banned.`, { status: 403 });
                 }
@@ -52,7 +52,7 @@ export default {
         
         if (env.GO2SOCKS5) SOCKS5白名单 = await 整理成数组(env.GO2SOCKS5);
 
-        // 🌟🌟🌟 [核心修改] WebSocket 请求处理入口 🌟🌟🌟
+        // 🌟🌟🌟 WebSocket 请求处理 (核心节点流量) 🌟🌟🌟
         if (upgradeHeader === 'websocket') {
             if (管理员密码) {
                 await 反代参数获取(request);
@@ -61,7 +61,7 @@ export default {
             }
         }
 
-        // 🌟🌟🌟 HTTP 请求处理 🌟🌟🌟
+        // 🌟🌟🌟 HTTP 请求处理 (订阅/管理) 🌟🌟🌟
         if (!upgradeHeader || upgradeHeader !== 'websocket') {
             if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
             
@@ -386,11 +386,12 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
     const readable = makeReadableStr(serverSock, earlyData);
 
     // ⚡️ 预加载 KV 数据，不阻塞握手
+    // 这里非常重要：必须同时加载“用户列表”和“黑名单”
     let kvDataPromise = null;
     if (env.KV) {
         kvDataPromise = Promise.all([
-            env.KV.get(KV_USER_LIST_KEY, { type: 'json' }), // 0: 用户列表
-            env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' })  // 1: 黑名单
+            env.KV.get(KV_USER_LIST_KEY, { type: 'json' }), // 0: 用户列表 (用于检查启用/禁用状态)
+            env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' })  // 1: 黑名单 (用于检查 IP)
         ]);
     }
 
@@ -423,7 +424,7 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
             }
 
             // 🛑🛑🛑 [关键] 实时鉴权：必须通过 verifyUserPermission 🛑🛑🛑
-            // 这步通过才会建立后续连接，否则断开，解决“旧节点依然可用”的问题
+            // 每次建立连接前，都要去 KV 查户口：是封禁IP？还是禁用UUID？还是管理员？
             try {
                 await verifyUserPermission(protocolData.requestUUID, adminUserID, clientIP, kvDataPromise);
             } catch (err) {
@@ -448,7 +449,7 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
     return new Response(null, { status: 101, webSocket: clientSock });
 }
 
-// 🌟🌟🌟 [核心修改] 严格权限校验函数 (黑名单优先 -> 管理员严格匹配 -> 必须在用户名单) 🌟🌟🌟
+// 🌟🌟🌟 [核心修改] 严格权限校验函数 (逻辑已修正) 🌟🌟🌟
 async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
     // 0. 基础数据清洗
     const targetUUID = (uuid || '').toLowerCase().trim();
@@ -462,36 +463,37 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
 
     const [userList, blockList] = await kvPromise;
 
-    // 🛑 2. 黑名单检查 (优先级最高：覆盖管理员)
-    // 遍历检查 IP 和 UUID 是否在黑名单中，忽略大小写和空格
+    // 🛑 2. 查黑名单 (KV_BLOCKLIST)：优先封杀 IP
+    // 注意：根据你的反馈，UUID封禁并不在黑名单里，黑名单主要放IP。
     if (blockList && Array.isArray(blockList)) {
-        const isBlocked = blockList.some(item => {
-            const val = (item.value || '').toLowerCase().trim();
-            return val === clientIP || val === targetUUID;
-        });
-        if (isBlocked) throw new Error('Blocked by Blacklist / 黑名单阻断');
+        if (blockList.some(item => item.value === clientIP)) {
+            throw new Error('IP Blocked'); // 发现IP在黑名单，直接杀
+        }
     }
 
-    // 🔑 3. 管理员检查 (放行)
-    // ❌ 严禁使用 includes，必须全等检查，防止误判
-    if (targetUUID === admin) return true;
-
-    // 👥 4. 用户白名单检查
-    // 核心逻辑：UUID 必须在 userList 中找到，否则就是“未授权用户” (例如已被删除的用户)
+    // 👥 3. 查用户表 (KV_USER_LIST)：检查 UUID 是否存在以及状态
+    // 这是修复“禁用 UUID 但仍能连接”的关键步骤
     if (userList && Array.isArray(userList)) {
         const user = userList.find(u => (u.token || '').toLowerCase().trim() === targetUUID);
         
-        // ❌ 如果找不到用户 -> 说明是无效/已删除的 UUID -> 拒绝
-        if (!user) throw new Error('Unauthorized UUID / 无效的UUID');
-        
-        // ❌ 如果用户被禁用 -> 拒绝 (解决“旧节点仍能使用”的核心代码)
-        if (user.enable === false) throw new Error('User Disabled / 用户已禁用');
-        
-        return true;
+        if (user) {
+            // ✅ 找到了用户，现在检查它的状态
+            if (user.enable === false) {
+                // ❌ 核心：用户存在，但被禁用了 -> 拒绝连接
+                throw new Error('User Disabled'); 
+            }
+            // ✅ 用户存在且启用 -> 放行
+            return true;
+        }
+        // 如果 userList 里没找到这个 UUID，说明可能不是普通用户，继续往下查管理员
     }
+
+    // 🔑 4. 查管理员权限
+    // 只有当“不是黑名单IP”且“不在用户表（或者没被禁用）”时，才看是不是管理员
+    if (targetUUID === admin) return true;
     
-    // 默认拒绝 (防止漏网之鱼)
-    throw new Error('Access Denied (Default) / 拒绝访问');
+    // ❌ 5. 默认拒绝 (既不在用户表，也不是管理员)
+    throw new Error('Access Denied (Unauthorized UUID)');
 }
 
 // 🛡️ [核心修改] 检查限流状态 + 自动拉黑
@@ -505,7 +507,6 @@ async function checkRateLimit(env, ip) {
 
         if (count >= RATE_LIMIT_BLOCK) {
             // 🚨 触发封禁：直接写入黑名单 KV
-            // 注意：edgetunnel 通常只负责读取黑名单，这里增加写入逻辑是为了同步防滥用状态
             let blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
             if (!blockList.some(item => item.value === ip)) {
                 blockList.push({ 
