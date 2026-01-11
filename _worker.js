@@ -448,7 +448,7 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
     return new Response(null, { status: 101, webSocket: clientSock });
 }
 
-// 🌟🌟🌟 [核心修改] 严格权限校验函数 (黑名单优先 -> 管理员 -> 用户名单) 🌟🌟🌟
+// 🌟🌟🌟 [核心修改] 严格权限校验函数 (黑名单优先 -> 管理员严格匹配 -> 必须在用户名单) 🌟🌟🌟
 async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
     // 0. 基础数据清洗
     const targetUUID = (uuid || '').toLowerCase().trim();
@@ -473,21 +473,24 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
     }
 
     // 🔑 3. 管理员检查 (放行)
-    // 只有没被黑名单拦截的管理员才能通过
+    // ❌ 严禁使用 includes，必须全等检查，防止误判
     if (targetUUID === admin) return true;
 
     // 👥 4. 用户白名单检查
-    // 必须在列表中存在 且 enable 为 true
+    // 核心逻辑：UUID 必须在 userList 中找到，否则就是“未授权用户” (例如已被删除的用户)
     if (userList && Array.isArray(userList)) {
         const user = userList.find(u => (u.token || '').toLowerCase().trim() === targetUUID);
         
+        // ❌ 如果找不到用户 -> 说明是无效/已删除的 UUID -> 拒绝
         if (!user) throw new Error('Unauthorized UUID / 无效的UUID');
+        
+        // ❌ 如果用户被禁用 -> 拒绝
         if (user.enable === false) throw new Error('User Disabled / 用户已禁用');
         
         return true;
     }
     
-    // 默认拒绝
+    // 默认拒绝 (防止漏网之鱼)
     throw new Error('Access Denied (Default) / 拒绝访问');
 }
 
