@@ -19,17 +19,14 @@ export default {
         // 🌟🌟🌟 0. 全局 IP 封禁检查 (HTTP层最优先阻断) 🌟🌟🌟
         const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || '未知IP';
         
-        // 优先读取黑名单，如果 IP 在黑名单中，HTTP 层面直接拒绝，节省资源
+        // 优先读取黑名单，如果 IP 在黑名单中，HTTP 层面直接拒绝
         if (env.KV) {
             try {
                 const blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
-                // 这里只检查 IP，因为 UUID 是在 WS 握手阶段解析的
                 if (blockList.some(item => item.value === 访问IP)) {
                     return new Response(`Access Denied: Your IP (${访问IP}) is banned.`, { status: 403 });
                 }
-            } catch (e) {
-                // KV 读取错误不阻断，避免系统故障导致全挂
-            }
+            } catch (e) { }
         }
 
         const url = new URL(request.url);
@@ -238,8 +235,7 @@ export default {
                 const 订阅TOKEN = await MD5MD5(host + adminUserID);
                 if (url.searchParams.get('token') === 订阅TOKEN) {
 
-                    // 🛡️ [新增] 防滥用检查：检查该 IP 今日刷新次数
-                    // 如果超过限制，直接返回 429，不给订阅内容
+                    // 🛡️ 防滥用：检查 IP 今日刷新次数
                     const limitStatus = await checkRateLimit(env, 访问IP);
                     if (limitStatus === 'BLOCK') {
                         return new Response("Rate Limit Exceeded: Too many refreshes.", { status: 429 });
@@ -298,13 +294,10 @@ export default {
                                     return null;
                                 }
 
-                                // 🚩 [新增功能] 节点自动识别国旗 (仅基于备注)
                                 let flag = "";
                                 if (节点备注.includes('移动') || 节点备注.includes('联通') || 节点备注.includes('电信')) {
-                                     // 如果是三大运营商，且备注里原本没旗子，加中国旗
                                      if (!节点备注.includes('🇨🇳')) flag = " 🇨🇳";
                                 } 
-                                // ⚠️ 严格执行要求：如果识别不到运营商且备注里没有旗子，绝不使用访问者地区充数。
                                 const finalNodeName = flag ? `${节点备注}${flag}` : (节点备注 || config_JSON.优选订阅生成.SUBNAME);
 
                                 const 节点HOST = 随机替换通配符(host);
@@ -385,8 +378,7 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readable = makeReadableStr(serverSock, earlyData);
 
-    // ⚡️ 修正点1：移除预加载，改为后续同步执行
-    // 之前这里使用了 Promise.all 预加载，现已移除，确保逻辑在 verifyUserPermission 中实时执行
+    // ⚡️ 移除并行预加载，改为严格同步执行
 
     readable.pipeTo(new WritableStream({
         async write(chunk) {
@@ -417,7 +409,7 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
             }
 
             // 🛑🛑🛑 [关键] 实时鉴权：必须通过 verifyUserPermission 🛑🛑🛑
-            // 修正点2：移除 kvDataPromise，直接传 env，在内部同步查询
+            // 修正：强制传递 env 并在内部实时查询
             try {
                 await verifyUserPermission(protocolData.requestUUID, adminUserID, clientIP, env);
             } catch (err) {
@@ -444,9 +436,12 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
 
 // 🌟🌟🌟 [核心修改] 严格权限校验函数 (逻辑已修正) 🌟🌟🌟
 async function verifyUserPermission(uuid, adminUUID, clientIP, env) {
-    // 0. 基础数据清洗
-    const targetUUID = (uuid || '').toLowerCase().trim();
-    const admin = (adminUUID || '').toLowerCase().trim();
+    // 0. 基础数据清洗 & 归一化 (移除所有横杠，转小写)
+    // 这样 2b6cf31f-d391... 和 2b6cf31fd391... 都会被视为同一个
+    const normalize = (s) => (s || '').toLowerCase().trim().replace(/-/g, '');
+    
+    const targetUUID = normalize(uuid);
+    const admin = normalize(adminUUID);
 
     // 1. 如果没绑定 KV，降级为仅管理员模式
     if (!env.KV) {
@@ -454,7 +449,7 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, env) {
          throw new Error('Access Denied: No KV & Not Admin');
     }
 
-    // ⚡️ 修正点3：强制同步等待读取 KV，拒绝并行/缓存
+    // ⚡️ 强制同步等待读取 KV，拒绝并行/缓存
     const blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
     
     // 🛑 2. 查黑名单 (KV_BLOCKLIST)：优先封杀 IP
@@ -464,28 +459,27 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, env) {
         }
     }
 
-    // ⚡️ 修正点4：强制同步读取用户列表
+    // ⚡️ 强制同步读取用户列表
     const userList = await env.KV.get(KV_USER_LIST_KEY, { type: 'json' }) || [];
 
-    // 👥 3. 查用户表 (KV_USER_LIST)：检查 UUID 是否存在以及状态
-    // 这是修复“禁用 UUID 但仍能连接”的关键步骤
+    // 👥 3. 查用户表 (KV_USER_LIST)
     if (userList && Array.isArray(userList)) {
-        const user = userList.find(u => (u.token || '').toLowerCase().trim() === targetUUID);
+        // 使用归一化后的 UUID 进行模糊匹配
+        const user = userList.find(u => normalize(u.token) === targetUUID);
         
         if (user) {
             // ✅ 找到了用户，现在检查它的状态
             if (user.enable === false) {
                 // ❌ 核心：用户存在，但被禁用了 -> 拒绝连接
+                // 绝对不许继续往下走去匹配管理员
                 throw new Error('User Disabled'); 
             }
             // ✅ 用户存在且启用 -> 放行
             return true;
         }
-        // 如果 userList 里没找到这个 UUID，说明可能不是普通用户，继续往下查管理员
     }
 
-    // 🔑 4. 查管理员权限
-    // 只有当“不是黑名单IP”且“不在用户表（或者没被禁用）”时，才看是不是管理员
+    // 🔑 4. 查管理员权限 (只有在用户表里没找到这个 UUID 时才执行)
     if (targetUUID === admin) return true;
     
     // ❌ 5. 默认拒绝 (既不在用户表，也不是管理员)
