@@ -464,7 +464,6 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
     const [userList, blockList] = await kvPromise;
 
     // 🛑 2. 查黑名单 (KV_BLOCKLIST)：优先封杀 IP
-    // 注意：根据你的反馈，UUID封禁并不在黑名单里，黑名单主要放IP。
     if (blockList && Array.isArray(blockList)) {
         if (blockList.some(item => item.value === clientIP)) {
             throw new Error('IP Blocked'); // 发现IP在黑名单，直接杀
@@ -1297,7 +1296,7 @@ async function 获取SOCKS5账号(address) {
     let hostname, port;
     if (hostPart.includes("]:")) { 
         [hostname, port] = [hostPart.split("]:")[0] + "]", Number(hostPart.split("]:")[1].replace(/[^\d]/g, ''))];
-    } else if (hostPart.startsWith("[")) { 
+    } else if (hostPart.startsWith('[')) { 
         [hostname, port] = [hostPart, 80];
     } else { 
         const parts = hostPart.split(":");
