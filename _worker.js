@@ -385,15 +385,8 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readable = makeReadableStr(serverSock, earlyData);
 
-    // ⚡️ 预加载 KV 数据，不阻塞握手
-    // 这里非常重要：必须同时加载“用户列表”和“黑名单”
-    let kvDataPromise = null;
-    if (env.KV) {
-        kvDataPromise = Promise.all([
-            env.KV.get(KV_USER_LIST_KEY, { type: 'json' }), // 0: 用户列表 (用于检查启用/禁用状态)
-            env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' })  // 1: 黑名单 (用于检查 IP)
-        ]);
-    }
+    // ⚡️ 修正点1：移除预加载，改为后续同步执行
+    // 之前这里使用了 Promise.all 预加载，现已移除，确保逻辑在 verifyUserPermission 中实时执行
 
     readable.pipeTo(new WritableStream({
         async write(chunk) {
@@ -424,9 +417,9 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
             }
 
             // 🛑🛑🛑 [关键] 实时鉴权：必须通过 verifyUserPermission 🛑🛑🛑
-            // 每次建立连接前，都要去 KV 查户口：是封禁IP？还是禁用UUID？还是管理员？
+            // 修正点2：移除 kvDataPromise，直接传 env，在内部同步查询
             try {
-                await verifyUserPermission(protocolData.requestUUID, adminUserID, clientIP, kvDataPromise);
+                await verifyUserPermission(protocolData.requestUUID, adminUserID, clientIP, env);
             } catch (err) {
                 // console.log(`[BLOCK] 连接被拒绝: ${err.message}`);
                 closeSocketQuietly(serverSock);
@@ -450,25 +443,29 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
 }
 
 // 🌟🌟🌟 [核心修改] 严格权限校验函数 (逻辑已修正) 🌟🌟🌟
-async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
+async function verifyUserPermission(uuid, adminUUID, clientIP, env) {
     // 0. 基础数据清洗
     const targetUUID = (uuid || '').toLowerCase().trim();
     const admin = (adminUUID || '').toLowerCase().trim();
 
     // 1. 如果没绑定 KV，降级为仅管理员模式
-    if (!kvPromise) {
+    if (!env.KV) {
          if (targetUUID === admin) return true;
          throw new Error('Access Denied: No KV & Not Admin');
     }
 
-    const [userList, blockList] = await kvPromise;
-
+    // ⚡️ 修正点3：强制同步等待读取 KV，拒绝并行/缓存
+    const blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
+    
     // 🛑 2. 查黑名单 (KV_BLOCKLIST)：优先封杀 IP
     if (blockList && Array.isArray(blockList)) {
         if (blockList.some(item => item.value === clientIP)) {
             throw new Error('IP Blocked'); // 发现IP在黑名单，直接杀
         }
     }
+
+    // ⚡️ 修正点4：强制同步读取用户列表
+    const userList = await env.KV.get(KV_USER_LIST_KEY, { type: 'json' }) || [];
 
     // 👥 3. 查用户表 (KV_USER_LIST)：检查 UUID 是否存在以及状态
     // 这是修复“禁用 UUID 但仍能连接”的关键步骤
