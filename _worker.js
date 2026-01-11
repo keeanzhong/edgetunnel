@@ -5,7 +5,7 @@ const KV_USER_LIST_KEY = 'CF_USER_LIST';
 const KV_BLOCKLIST_KEY = 'CF_BLOCKLIST';
 const KV_RATE_LIMIT_KEY = 'CF_RATE_LIMIT';
 
-// 🛡️ [新增] 防滥用配置
+// 🛡️ [防滥用配置]
 const RATE_LIMIT_WARNING = 20; 
 const RATE_LIMIT_BLOCK = 50;   
 
@@ -16,14 +16,14 @@ const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////
 export default {
     async fetch(request, env, ctx) {
-        // 🌟🌟🌟 [新增功能] 0. 全局 IP 封禁检查 (最优先阻断) 🌟🌟🌟
-        // 只要 IP 在黑名单，直接 403，不再进行任何后续处理
-        const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('True-Client-IP') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || request.cf?.clientTcpRtt || '未知IP';
+        // 🌟🌟🌟 0. 全局 IP 封禁检查 (HTTP层最优先阻断) 🌟🌟🌟
+        const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || '未知IP';
         
         if (env.KV) {
             try {
                 // 尝试读取黑名单
                 const blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
+                // 如果 IP 在黑名单，直接 403
                 if (blockList.some(item => item.value === 访问IP)) {
                     return new Response(`Access Denied: Your IP (${访问IP}) is banned.`, { status: 403 });
                 }
@@ -40,7 +40,7 @@ export default {
         const userIDMD5 = await MD5MD5(管理员密码 + 加密秘钥);
         const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
         const envUUID = env.UUID || env.uuid;
-        // 这是管理员的默认 UUID
+        // 这是管理员的默认 UUID (超级用户)
         const adminUserID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), userIDMD5.slice(16, 20), userIDMD5.slice(20)].join('-');
         
         const host = env.HOST ? env.HOST.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0] : url.hostname;
@@ -52,19 +52,16 @@ export default {
         
         if (env.GO2SOCKS5) SOCKS5白名单 = await 整理成数组(env.GO2SOCKS5);
 
-        // 🌟🌟🌟 [核心修复] WebSocket 请求处理入口 (VLESS/Trojan 流量) 🌟🌟🌟
-        // 这里提前处理 WS，并注入 UUID 实时鉴权逻辑
+        // 🌟🌟🌟 [核心修改] WebSocket 请求处理入口 🌟🌟🌟
         if (upgradeHeader === 'websocket') {
             if (管理员密码) {
                 await 反代参数获取(request);
-                // 进入带有【实时鉴权】功能的 WS 处理函数，传入 env 和 IP
+                // 传入 KV, AdminID, IP 进行严格鉴权
                 return await 处理WS请求(request, env, adminUserID, 访问IP);
             }
-            // 如果没有管理员密码，后续逻辑会处理（通常是伪装页）
         }
 
-        // 🌟🌟🌟 HTTP 请求处理逻辑 🌟🌟🌟
-        // 只有非 WebSocket 请求才会走到这里
+        // 🌟🌟🌟 HTTP 请求处理 🌟🌟🌟
         if (!upgradeHeader || upgradeHeader !== 'websocket') {
             if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
             
@@ -378,7 +375,7 @@ export default {
 };
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-// 🌟🌟🌟 [核心修改] 实时连接鉴权逻辑 🌟🌟🌟
+// 🌟🌟🌟 [核心修改] 实时连接鉴权逻辑 (解决节点不失效问题) 🌟🌟🌟
 async function 处理WS请求(request, env, adminUserID, clientIP) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
@@ -451,63 +448,58 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
     return new Response(null, { status: 101, webSocket: clientSock });
 }
 
-// 🌟🌟🌟 [核心修改] 严格权限校验函数 (白名单 + 黑名单双重检查) 🌟🌟🌟
+// 🌟🌟🌟 [核心修改] 严格权限校验函数 (黑名单优先 -> 管理员 -> 用户名单) 🌟🌟🌟
 async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
-    // 1. 判空
-    if (!uuid) throw new Error('No UUID provided');
-    const targetUUID = uuid.toLowerCase();
-    const admin = adminUUID.toLowerCase();
+    // 0. 基础数据清洗
+    const targetUUID = (uuid || '').toLowerCase().trim();
+    const admin = (adminUUID || '').toLowerCase().trim();
 
-    // 2. 超级管理员：永远放行 (Trojan password hash 或 VLESS UUID)
-    if (targetUUID.includes(admin) || targetUUID === admin) return true;
-    
-    // 3. 如果没绑定 KV，且不是管理员 -> 默认拒绝 (白名单模式)
-    if (!kvPromise) throw new Error('Access Denied: No KV & Not Admin');
+    // 1. 如果没绑定 KV，降级为仅管理员模式
+    if (!kvPromise) {
+         if (targetUUID === admin) return true;
+         throw new Error('Access Denied: No KV & Not Admin');
+    }
 
     const [userList, blockList] = await kvPromise;
 
-    // 4. 检查黑名单 (优先级高)
-    // 如果 IP 或 UUID 在黑名单中，无论如何都拒绝
+    // 🛑 2. 黑名单检查 (优先级最高：覆盖管理员)
+    // 遍历检查 IP 和 UUID 是否在黑名单中，忽略大小写和空格
     if (blockList && Array.isArray(blockList)) {
-        if (blockList.some(b => b.value === clientIP || b.value === targetUUID)) {
-             throw new Error('Blocked by Blacklist');
-        }
+        const isBlocked = blockList.some(item => {
+            const val = (item.value || '').toLowerCase().trim();
+            return val === clientIP || val === targetUUID;
+        });
+        if (isBlocked) throw new Error('Blocked by Blacklist / 黑名单阻断');
     }
 
-    // 5. 检查用户白名单 (必须在列表中 且 启用)
-    // 如果 UUID 不在 userList 中，说明是未授权的（如旧的 DefaultUUID），直接拒绝
-    if (userList && Array.isArray(userList)) {
-        const user = userList.find(u => u.token.toLowerCase() === targetUUID);
-        
-        if (!user) {
-            // ❌ 核心：如果 UUID 不在用户列表，也不是管理员 -> 拒绝
-            // 防止有人猜到 UUID 或者使用已删除的 UUID
-            throw new Error('Unauthorized UUID (Not in User List)');
-        }
-        
-        if (user.enable === false) {
-            // ❌ 核心：用户被禁用 -> 拒绝
-            throw new Error('User is Disabled');
-        }
+    // 🔑 3. 管理员检查 (放行)
+    // 只有没被黑名单拦截的管理员才能通过
+    if (targetUUID === admin) return true;
 
-        // ✅ 验证通过
+    // 👥 4. 用户白名单检查
+    // 必须在列表中存在 且 enable 为 true
+    if (userList && Array.isArray(userList)) {
+        const user = userList.find(u => (u.token || '').toLowerCase().trim() === targetUUID);
+        
+        if (!user) throw new Error('Unauthorized UUID / 无效的UUID');
+        if (user.enable === false) throw new Error('User Disabled / 用户已禁用');
+        
         return true;
     }
     
     // 默认拒绝
-    throw new Error('Access Denied (Default)');
+    throw new Error('Access Denied (Default) / 拒绝访问');
 }
 
-// 🛡️ [核心修改] 检查限流状态 + 自动写入黑名单
+// 🛡️ [核心修改] 检查限流状态 + 自动拉黑
 async function checkRateLimit(env, ip) {
     try {
-        const today = new Date().toISOString().split('T')[0]; // 获取日期 YYYY-MM-DD
+        const today = new Date().toISOString().split('T')[0];
         const key = `${KV_RATE_LIMIT_KEY}:${today}:${ip}`;
 
         let count = await env.KV.get(key);
         count = parseInt(count) || 0;
 
-        // 如果超过阻断阈值
         if (count >= RATE_LIMIT_BLOCK) {
             // 🚨 触发封禁：直接写入黑名单 KV
             // 注意：edgetunnel 通常只负责读取黑名单，这里增加写入逻辑是为了同步防滥用状态
@@ -531,7 +523,6 @@ async function checkRateLimit(env, ip) {
         }
         return 'OK';
     } catch (e) {
-        // KV 出错不阻断正常业务
         return 'OK';
     }
 }
@@ -643,7 +634,7 @@ function 解析魏烈思请求(chunk) {
 }
 
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper) {
-    console.log(JSON.stringify({ configJSON: { 目标地址: host, 目标端口: portNum, 反代IP: 反代IP, 代理类型: 启用SOCKS5反代, 全局代理: 启用SOCKS5全局反代, 代理账号: 我的SOCKS5账号 } }));
+    // console.log(JSON.stringify({ configJSON: { 目标地址: host, 目标端口: portNum, 反代IP: 反代IP, 代理类型: 启用SOCKS5反代, 全局代理: 启用SOCKS5全局反代, 代理账号: 我的SOCKS5账号 } }));
     async function connectDirect(address, port, data) {
         const remoteSock = connect({ hostname: address, port: port });
         const writer = remoteSock.writable.getWriter();
@@ -803,6 +794,7 @@ function base64ToArray(b64Str) {
         return { error };
     }
 }
+
 ////////////////////////////////SOCKS5/HTTP函数///////////////////////////////////////////////
 async function socks5Connect(targetHost, targetPort, initialData) {
     const { username, password, hostname, port } = parsedSocks5Address;
@@ -872,6 +864,7 @@ async function httpConnect(targetHost, targetPort, initialData) {
         throw error;
     }
 }
+
 //////////////////////////////////////////////////功能性函数///////////////////////////////////////////////
 function surge(content, url, config_JSON) {
     const 每行内容 = content.includes('\r\n') ? content.split('\r\n') : content.split('\n');
