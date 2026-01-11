@@ -484,7 +484,7 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
         // ❌ 如果找不到用户 -> 说明是无效/已删除的 UUID -> 拒绝
         if (!user) throw new Error('Unauthorized UUID / 无效的UUID');
         
-        // ❌ 如果用户被禁用 -> 拒绝
+        // ❌ 如果用户被禁用 -> 拒绝 (解决“旧节点仍能使用”的核心代码)
         if (user.enable === false) throw new Error('User Disabled / 用户已禁用');
         
         return true;
