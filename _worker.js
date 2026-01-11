@@ -21,11 +21,15 @@ export default {
         
         if (env.KV) {
             try {
+                // 尝试读取黑名单
                 const blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
+                // 如果 IP 在黑名单，直接 403
                 if (blockList.some(item => item.value === 访问IP)) {
                     return new Response(`Access Denied: Your IP (${访问IP}) is banned.`, { status: 403 });
                 }
-            } catch (e) {}
+            } catch (e) {
+                // KV 读取错误不阻断，避免系统故障导致全挂
+            }
         }
 
         const url = new URL(request.url);
@@ -61,6 +65,7 @@ export default {
         if (!upgradeHeader || upgradeHeader !== 'websocket') {
             if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
             
+            // 基础检查
             if (!管理员密码) return fetch(Pages静态页面 + '/noADMIN').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }); });
             if (!env.KV) return fetch(Pages静态页面 + '/noKV').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }); });
             
@@ -492,13 +497,12 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
 // 🛡️ [核心修改] 检查限流状态 + 自动拉黑
 async function checkRateLimit(env, ip) {
     try {
-        const today = new Date().toISOString().split('T')[0]; // 获取日期 YYYY-MM-DD
+        const today = new Date().toISOString().split('T')[0];
         const key = `${KV_RATE_LIMIT_KEY}:${today}:${ip}`;
 
         let count = await env.KV.get(key);
         count = parseInt(count) || 0;
 
-        // 如果超过阻断阈值
         if (count >= RATE_LIMIT_BLOCK) {
             // 🚨 触发封禁：直接写入黑名单 KV
             // 注意：edgetunnel 通常只负责读取黑名单，这里增加写入逻辑是为了同步防滥用状态
