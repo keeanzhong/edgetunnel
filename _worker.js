@@ -5,7 +5,7 @@ const KV_USER_LIST_KEY = 'CF_USER_LIST';
 const KV_BLOCKLIST_KEY = 'CF_BLOCKLIST';
 const KV_RATE_LIMIT_KEY = 'CF_RATE_LIMIT';
 
-// 🛡️ [防滥用配置]
+// 🛡️ [新增] 防滥用配置
 const RATE_LIMIT_WARNING = 20; 
 const RATE_LIMIT_BLOCK = 50;   
 
@@ -16,14 +16,14 @@ const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////
 export default {
     async fetch(request, env, ctx) {
-        // 🌟🌟🌟 0. 全局 IP 封禁检查 (HTTP层最优先阻断) 🌟🌟🌟
-        const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || '未知IP';
+        // 🌟🌟🌟 [新增功能] 0. 全局 IP 封禁检查 (最优先阻断) 🌟🌟🌟
+        // 只要 IP 在黑名单，直接 403，不再进行任何后续处理
+        const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('True-Client-IP') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || request.cf?.clientTcpRtt || '未知IP';
         
         if (env.KV) {
             try {
                 // 尝试读取黑名单
                 const blockList = await env.KV.get(KV_BLOCKLIST_KEY, { type: 'json' }) || [];
-                // 如果 IP 在黑名单，直接 403
                 if (blockList.some(item => item.value === 访问IP)) {
                     return new Response(`Access Denied: Your IP (${访问IP}) is banned.`, { status: 403 });
                 }
@@ -40,7 +40,7 @@ export default {
         const userIDMD5 = await MD5MD5(管理员密码 + 加密秘钥);
         const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
         const envUUID = env.UUID || env.uuid;
-        // 这是管理员的默认 UUID (超级用户)
+        // 这是管理员的默认 UUID
         const adminUserID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), userIDMD5.slice(16, 20), userIDMD5.slice(20)].join('-');
         
         const host = env.HOST ? env.HOST.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0] : url.hostname;
@@ -52,16 +52,19 @@ export default {
         
         if (env.GO2SOCKS5) SOCKS5白名单 = await 整理成数组(env.GO2SOCKS5);
 
-        // 🌟🌟🌟 [核心修改] WebSocket 请求处理入口 🌟🌟🌟
+        // 🌟🌟🌟 [核心修复] WebSocket 请求处理入口 (VLESS/Trojan 流量) 🌟🌟🌟
+        // 这里提前处理 WS，并注入 UUID 实时鉴权逻辑
         if (upgradeHeader === 'websocket') {
             if (管理员密码) {
                 await 反代参数获取(request);
-                // 传入 KV, AdminID, IP 进行严格鉴权
+                // 进入带有【实时鉴权】功能的 WS 处理函数，传入 env 和 IP
                 return await 处理WS请求(request, env, adminUserID, 访问IP);
             }
+            // 如果没有管理员密码，后续逻辑会处理（通常是伪装页）
         }
 
-        // 🌟🌟🌟 HTTP 请求处理 🌟🌟🌟
+        // 🌟🌟🌟 HTTP 请求处理逻辑 🌟🌟🌟
+        // 只有非 WebSocket 请求才会走到这里
         if (!upgradeHeader || upgradeHeader !== 'websocket') {
             if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
             
@@ -375,7 +378,7 @@ export default {
 };
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-// 🌟🌟🌟 [核心修改] 实时连接鉴权逻辑 (解决节点不失效问题) 🌟🌟🌟
+// 🌟🌟🌟 [核心修改] 实时连接鉴权逻辑 🌟🌟🌟
 async function 处理WS请求(request, env, adminUserID, clientIP) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
@@ -478,6 +481,7 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
         
         if (!user) {
             // ❌ 核心：如果 UUID 不在用户列表，也不是管理员 -> 拒绝
+            // 防止有人猜到 UUID 或者使用已删除的 UUID
             throw new Error('Unauthorized UUID (Not in User List)');
         }
         
@@ -494,15 +498,16 @@ async function verifyUserPermission(uuid, adminUUID, clientIP, kvPromise) {
     throw new Error('Access Denied (Default)');
 }
 
-// 🛡️ [核心修改] 检查限流状态 + 自动拉黑
+// 🛡️ [核心修改] 检查限流状态 + 自动写入黑名单
 async function checkRateLimit(env, ip) {
     try {
-        const today = new Date().toISOString().split('T')[0];
+        const today = new Date().toISOString().split('T')[0]; // 获取日期 YYYY-MM-DD
         const key = `${KV_RATE_LIMIT_KEY}:${today}:${ip}`;
 
         let count = await env.KV.get(key);
         count = parseInt(count) || 0;
 
+        // 如果超过阻断阈值
         if (count >= RATE_LIMIT_BLOCK) {
             // 🚨 触发封禁：直接写入黑名单 KV
             // 注意：edgetunnel 通常只负责读取黑名单，这里增加写入逻辑是为了同步防滥用状态
@@ -526,6 +531,7 @@ async function checkRateLimit(env, ip) {
         }
         return 'OK';
     } catch (e) {
+        // KV 出错不阻断正常业务
         return 'OK';
     }
 }
