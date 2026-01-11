@@ -6,8 +6,8 @@ const KV_BLOCKLIST_KEY = 'CF_BLOCKLIST';
 const KV_RATE_LIMIT_KEY = 'CF_RATE_LIMIT';
 
 // 🛡️ [防滥用配置]
-const RATE_LIMIT_WARNING = 20; 
-const RATE_LIMIT_BLOCK = 50;   
+const RATE_LIMIT_WARNING = 20;
+const RATE_LIMIT_BLOCK = 50;
 
 let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
@@ -18,7 +18,7 @@ export default {
     async fetch(request, env, ctx) {
         // 🌟🌟🌟 0. 全局 IP 封禁检查 (HTTP层最优先阻断) 🌟🌟🌟
         const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || '未知IP';
-        
+
         // 优先读取黑名单，如果 IP 在黑名单中，HTTP 层面直接拒绝
         if (env.KV) {
             try {
@@ -37,16 +37,17 @@ export default {
         const userIDMD5 = await MD5MD5(管理员密码 + 加密秘钥);
         const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
         const envUUID = env.UUID || env.uuid;
+        
         // 这是管理员的默认 UUID (超级用户)
         const adminUserID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), userIDMD5.slice(16, 20), userIDMD5.slice(20)].join('-');
-        
+
         const host = env.HOST ? env.HOST.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0] : url.hostname;
-        
+
         if (env.PROXYIP) {
             const proxyIPs = await 整理成数组(env.PROXYIP);
             反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
         } else 反代IP = (request.cf.colo + '.PrOxYIp.CmLiUsSsS.nEt').toLowerCase();
-        
+
         if (env.GO2SOCKS5) SOCKS5白名单 = await 整理成数组(env.GO2SOCKS5);
 
         // 🌟🌟🌟 WebSocket 请求处理 (核心节点流量) 🌟🌟🌟
@@ -61,21 +62,21 @@ export default {
         // 🌟🌟🌟 HTTP 请求处理 (订阅/管理) 🌟🌟🌟
         if (!upgradeHeader || upgradeHeader !== 'websocket') {
             if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
-            
+
             // 基础检查
             if (!管理员密码) return fetch(Pages静态页面 + '/noADMIN').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }); });
             if (!env.KV) return fetch(Pages静态页面 + '/noKV').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }); });
-            
+
             const 访问路径 = url.pathname.slice(1).toLowerCase();
             const 区分大小写访问路径 = url.pathname.slice(1);
-            
+
             // 1. 快速订阅
             if (访问路径 === 加密秘钥 && 加密秘钥 !== '勿动此默认密钥，有需求请自行通过添加变量KEY进行修改') {
                 const params = new URLSearchParams(url.search);
                 params.set('token', await MD5MD5(host + adminUserID));
                 return new Response('重定向中...', { status: 302, headers: { 'Location': `/sub?${params.toString()}` } });
-            } 
-            
+            }
+
             // 2. 登录页面
             else if (访问路径 === 'login') {
                 const cookies = request.headers.get('Cookie') || '';
@@ -92,14 +93,14 @@ export default {
                     }
                 }
                 return fetch(Pages静态页面 + '/login');
-            } 
-            
+            }
+
             // 3. 管理后台
             else if (访问路径 == 'admin' || 访问路径.startsWith('admin/')) {
                 const cookies = request.headers.get('Cookie') || '';
                 const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
                 if (!authCookie || authCookie !== await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
-                
+
                 if (访问路径 === 'admin/log.json') {
                     const 读取日志内容 = await env.KV.get('log.json') || '[]';
                     return new Response(读取日志内容, { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
@@ -221,15 +222,15 @@ export default {
 
                 ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
                 return fetch(Pages静态页面 + '/admin');
-            } 
-            
+            }
+
             // 4. 退出登录
             else if (访问路径 === 'logout') {
                 const 响应 = new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
                 响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
                 return 响应;
-            } 
-            
+            }
+
             // 5. 订阅下发
             else if (访问路径 === 'sub') {
                 const 订阅TOKEN = await MD5MD5(host + adminUserID);
@@ -279,7 +280,7 @@ export default {
                             else 优选IP.push(元素);
                         }
                         const 其他节点LINK = 其他节点.join('\n') + '\n';
-                        if (!url.searchParams.has('sub') && config_JSON.优选订阅生成.local) { 
+                        if (!url.searchParams.has('sub') && config_JSON.优选订阅生成.local) {
                             const 优选API的IP = await 请求优选API(优选API);
                             const 完整优选IP = [...new Set(优选IP.concat(优选API的IP))];
                             订阅内容 = 完整优选IP.map(原始地址 => {
@@ -287,24 +288,24 @@ export default {
                                 const match = 原始地址.match(regex);
                                 let 节点地址, 节点端口 = "443", 节点备注;
                                 if (match) {
-                                    节点地址 = match[1]; 
-                                    节点端口 = match[2] || "443"; 
-                                    节点备注 = match[3] || 节点地址; 
+                                    节点地址 = match[1];
+                                    节点端口 = match[2] || "443";
+                                    节点备注 = match[3] || 节点地址;
                                 } else {
                                     return null;
                                 }
 
                                 let flag = "";
                                 if (节点备注.includes('移动') || 节点备注.includes('联通') || 节点备注.includes('电信')) {
-                                     if (!节点备注.includes('🇨🇳')) flag = " 🇨🇳";
-                                } 
+                                    if (!节点备注.includes('🇨🇳')) flag = " 🇨🇳";
+                                }
                                 const finalNodeName = flag ? `${节点备注}${flag}` : (节点备注 || config_JSON.优选订阅生成.SUBNAME);
 
                                 const 节点HOST = 随机替换通配符(host);
                                 return `${协议类型}://${config_JSON.UUID}@${节点地址}:${节点端口}?security=tls&type=${config_JSON.传输协议}&host=${节点HOST}&sni=${节点HOST}&path=${encodeURIComponent(config_JSON.随机路径 ? 随机路径() + 节点路径 : 节点路径) + TLS分片参数}&encryption=none${config_JSON.跳过证书验证 ? '&allowInsecure=1' : ''}#${encodeURIComponent(finalNodeName)}`;
                             }).filter(item => item !== null).join('\n');
                             订阅内容 = btoa(其他节点LINK + 订阅内容);
-                        } else { 
+                        } else {
                             let 优选订阅生成器HOST = url.searchParams.get('sub') || config_JSON.优选订阅生成.SUB;
                             优选订阅生成器HOST = 优选订阅生成器HOST && !/^https?:\/\//i.test(优选订阅生成器HOST) ? `https://${优选订阅生成器HOST}` : 优选订阅生成器HOST;
                             const 优选订阅生成器URL = `${优选订阅生成器HOST}/sub?host=example.com&${协议类型 === ('v' + 'le' + 'ss') ? 'uuid' : 'pw'}=00000000-0000-4000-8000-000000000000&path=${encodeURIComponent(config_JSON.随机路径 ? 随机路径() + 节点路径 : 节点路径) + TLS分片参数}&type=${config_JSON.传输协议}`;
@@ -316,7 +317,7 @@ export default {
                                 return new Response('优选订阅生成器异常：' + error.message, { status: 403 });
                             }
                         }
-                    } else { 
+                    } else {
                         const 订阅转换URL = `${config_JSON.订阅转换配置.SUBAPI}/sub?target=${订阅类型}&url=${encodeURIComponent(url.protocol + '//' + url.host + '/sub?target=mixed&token=' + 订阅TOKEN + (url.searchParams.has('sub') && url.searchParams.get('sub') != '' ? `&sub=${url.searchParams.get('sub')}` : ''))}&config=${encodeURIComponent(config_JSON.订阅转换配置.SUBCONFIG)}&emoji=${config_JSON.订阅转换配置.SUBEMOJI}&scv=${config_JSON.跳过证书验证}`;
                         try {
                             const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel(https://github.com/cmliu/edge' + 'tunnel)' } });
@@ -341,8 +342,8 @@ export default {
                     return new Response(订阅内容, { status: 200, headers: responseHeaders });
                 }
                 return new Response('无效的订阅TOKEN', { status: 403 });
-            } 
-            
+            }
+
             // 6. 测速
             else if (访问路径 === 'locations') return fetch(new Request('https://speed.cloudflare.com/locations'));
         }
@@ -400,8 +401,8 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
                 // 尝试 Trojan 解析
                 const trojanParsed = 解析木马请求(chunk, adminUserID);
                 if (!trojanParsed.hasError) {
-                     protocolData = trojanParsed;
-                     protocolData.requestUUID = trojanParsed.password; // Trojan password 作为鉴权key
+                    protocolData = trojanParsed;
+                    protocolData.requestUUID = trojanParsed.password; // Trojan password 作为鉴权key
                 } else {
                     closeSocketQuietly(serverSock);
                     return;
@@ -420,7 +421,7 @@ async function 处理WS请求(request, env, adminUserID, clientIP) {
 
             // 鉴权通过，建立连接
             if (protocolData.isUDP && protocolData.port === 53) isDnsQuery = true;
-            
+
             const respHeader = protocolData.version ? new Uint8Array([protocolData.version[0], 0]) : null;
             const rawData = protocolData.rawClientData ? protocolData.rawClientData : chunk.slice(protocolData.rawIndex);
 
